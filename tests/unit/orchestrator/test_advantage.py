@@ -7,9 +7,15 @@ from prime_rl.configs.algorithm import (
     GRPOAlgoConfig,
     LinearLengthPenaltyConfig,
     MaxRLAlgoConfig,
+    QorlAnchoredGRPOAlgoConfig,
 )
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.max_rl import MaxRLAlgorithm
+from prime_rl.orchestrator.algo.qorl_anchored_grpo import (
+    QorlAnchoredGRPO,
+    QorlDecision,
+    anchored_advantages,
+)
 from prime_rl.orchestrator.algo.routing import assign_advantages
 from prime_rl.orchestrator.trajectories import trace_to_samples
 
@@ -110,6 +116,7 @@ def _build_episode(
         task=trace.task,
         group=vf.GroupInfo(id="group"),
         traces=[trace],
+        ok=True,
     )
     return episode
 
@@ -165,6 +172,32 @@ def _max_rl(group: list[vf.Episode]) -> list[float]:
     return [_scalar(episode) for episode in group]
 
 
+def _qorl(decisions: list[QorlDecision]) -> list[float]:
+    return [
+        result.advantage
+        for result in anchored_advantages(
+            decisions,
+            tau=0.05,
+            c=0.10,
+            d=0.02,
+            min_peers=2,
+        )
+    ]
+
+
+def _qorl_group(finals: list[dict]) -> list[vf.Episode]:
+    group = _make_group([0.0] * len(finals))
+    for episode, final in zip(group, finals, strict=True):
+        episode.traces[0].info["qorl"] = {"final": final}
+    return group
+
+
+def _score_qorl_group(group: list[vf.Episode], expected_group_size: int = 4) -> list[float]:
+    config = QorlAnchoredGRPOAlgoConfig(expected_group_size=expected_group_size)
+    asyncio.run(QorlAnchoredGRPO(config, clients=None).score_group(group))
+    return [_scalar(episode) for episode in group if not episode.traces[0].has_error]
+
+
 # --------------------------------------------------------------------------
 # GRPO / MaxRL: group-relative credit, assigned in score_group.
 # --------------------------------------------------------------------------
@@ -188,6 +221,146 @@ def test_max_rl_mean_normalized():
     assert _max_rl(_make_group(rewards=[0.0, 0.0])) == pytest.approx([0.0, 0.0])
     # ... and all-success groups center to zero like GRPO
     assert _max_rl(_make_group(rewards=[1.0, 1.0])) == pytest.approx([0.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    ("decisions", "expected"),
+    [
+        (
+            [QorlDecision("candidate", score) for score in (1.10, 1.05, 1.17, 1.40)],
+            [-0.086, -0.146, -0.004, 0.236],
+        ),
+        (
+            [QorlDecision("candidate", score) for score in (0.95, 0.90, 0.80, 0.70)],
+            [-0.001, -0.055, -0.173, -0.307],
+        ),
+        (
+            [QorlDecision("candidate", 1.40), *[QorlDecision("invalid")] * 3],
+            [0.286, -0.100, -0.100, -0.100],
+        ),
+        (
+            [QorlDecision("timeout", 0.1), *[QorlDecision("candidate", score) for score in (1.05, 1.03, 1.02)]],
+            [-2.253, 0.0, 0.0, 0.0],
+        ),
+        (
+            [QorlDecision("keep_default"), *[QorlDecision("candidate", score) for score in (0.90, 0.80, 0.70)]],
+            [0.0, -0.055, -0.173, -0.307],
+        ),
+        (
+            [
+                QorlDecision("keep_default"),
+                QorlDecision("candidate", 1.40),
+                QorlDecision("keep_default"),
+                QorlDecision("keep_default"),
+            ],
+            [-0.095, 0.286, -0.095, -0.095],
+        ),
+        (
+            [
+                QorlDecision("candidate", 1.40),
+                QorlDecision("candidate", 1.10),
+                QorlDecision("invalid"),
+                QorlDecision("invalid"),
+            ],
+            [0.286, 0.045, -0.100, -0.100],
+        ),
+        (
+            [
+                QorlDecision("candidate", 1.40),
+                QorlDecision("candidate", 1.10),
+                QorlDecision("candidate", 1.05),
+                QorlDecision("timeout", 0.1),
+            ],
+            [0.286, 0.045, 0.0, -2.363],
+        ),
+        (
+            [
+                QorlDecision("keep_default"),
+                QorlDecision("default_duplicate"),
+                QorlDecision("keep_default"),
+                QorlDecision("default_duplicate"),
+            ],
+            [0.0, -0.02, 0.0, -0.02],
+        ),
+        (
+            [QorlDecision("invalid")] * 4,
+            [-0.10] * 4,
+        ),
+    ],
+)
+def test_qorl_anchored_grpo_worked_examples(decisions, expected):
+    assert _qorl(decisions) == pytest.approx(expected, abs=1e-3)
+
+
+def test_qorl_anchored_grpo_reads_qorl_final_results():
+    group = _qorl_group(
+        [
+            {"status": "completed", "score_source": "explicit_keep_default", "score": 1.0},
+            {"status": "completed", "score_source": "default_fingerprint", "score": 1.0},
+            {"status": "completed", "score_source": "interleaved_measurement", "score": 1.4},
+            {"status": "no_valid_candidate", "score": 0.0},
+        ]
+    )
+
+    advantages = _score_qorl_group(group)
+
+    assert advantages == pytest.approx([-0.143, -0.163, 0.286, -0.1], abs=1e-3)
+    logged = group[2].traces[0].info["qorl_advantage"]
+    assert logged["rule"] == "qorl_anchored_grpo"
+    assert logged["discarded"] is False
+    assert logged["kind"] == "candidate"
+    numeric = {key: logged[key] for key in ("quality", "reference", "protocol_cost", "advantage")}
+    assert numeric == pytest.approx(
+        {"quality": 0.286, "reference": 0.0, "protocol_cost": 0.0, "advantage": 0.286},
+        abs=1e-3,
+    )
+
+
+def test_qorl_anchored_grpo_discards_incomplete_group():
+    group = _qorl_group([{"status": "completed", "score_source": "interleaved_measurement", "score": 1.4}] * 3)
+
+    advantages = _score_qorl_group(group)
+
+    assert advantages == [0.0, 0.0, 0.0]
+    assert all(episode.traces[0].info["qorl_advantage"]["discard_reason"] == "incomplete_group" for episode in group)
+
+
+def test_qorl_anchored_grpo_discards_group_with_error():
+    group = _qorl_group([{"status": "completed", "score_source": "interleaved_measurement", "score": 1.4}] * 4)
+    group[0].traces[0].ok = False
+
+    advantages = _score_qorl_group(group)
+
+    assert advantages == [0.0, 0.0, 0.0]
+    assert all(episode.traces[0].info["qorl_advantage"]["discard_reason"] == "errored_group" for episode in group)
+
+
+@pytest.mark.parametrize(
+    ("case", "bad_final"),
+    [
+        ("missing", None),
+        ("unknown_status", {"status": "unknown"}),
+        (
+            "invalid_score",
+            {
+                "status": "completed",
+                "score_source": "interleaved_measurement",
+                "score": "not-a-number",
+            },
+        ),
+    ],
+)
+def test_qorl_anchored_grpo_discards_unsupported_final(case, bad_final):
+    group = _qorl_group([{"status": "completed", "score_source": "interleaved_measurement", "score": 1.4}] * 4)
+    if case == "missing":
+        group[0].traces[0].info["qorl"].pop("final")
+    else:
+        group[0].traces[0].info["qorl"]["final"] = bad_final
+
+    advantages = _score_qorl_group(group)
+
+    assert advantages == [0.0] * 4
+    assert all(episode.traces[0].info["qorl_advantage"]["discard_reason"] == "unsupported_final" for episode in group)
 
 
 # --------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 """Algorithm abstraction: sampling and the per-token training signal.
 
 An algorithm is a named, self-contained config — a discriminated union keyed
-on ``type`` (``grpo``, ``max_rl``, ``opd``, ``opsd``, ``sft``, ``echo``).
+on ``type`` (``grpo``, ``qorl_anchored_grpo``, ``max_rl``, ``opd``, ``opsd``,
+``sft``, ``echo``).
 The bundle *is* the algorithm: each variant carries
 its sampling component and its credit-assignment / loss-routing parameters,
 and its class defaults are the vetted setting — ``type = "opd"`` with a
@@ -208,6 +209,29 @@ class GRPOAlgoConfig(BaseAlgoConfig):
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""
 
 
+class QorlAnchoredGRPOAlgoConfig(BaseAlgoConfig):
+    type: Literal["qorl_anchored_grpo"] = "qorl_anchored_grpo"
+    """QORL-specific group-relative credit anchored at the known value of
+    PostgreSQL's default plan."""
+
+    action_loss_type: ClassVar[ActionLossType] = "rl"
+
+    tau: float = Field(0.05, ge=0, allow_inf_nan=False)
+    """Soft threshold applied to clipped log speedup."""
+
+    c: float = Field(0.10, gt=0, allow_inf_nan=False)
+    """Fixed negative advantage assigned to an invalid decision."""
+
+    d: float = Field(0.02, ge=0, allow_inf_nan=False)
+    """Protocol cost applied to a PlanAction that reproduces the default."""
+
+    min_peers: int = Field(2, ge=1)
+    """Minimum valid siblings required to use their mean as a reference."""
+
+    expected_group_size: int = Field(4, ge=1)
+    """Exact rollout-group size required for an attributable update."""
+
+
 class EchoAlgoConfig(GRPOAlgoConfig):
     type: Literal["echo"] = "echo"  # type: ignore[assignment]
     """ECHO: group-relative advantage on action tokens (GRPO), plus weighted
@@ -366,6 +390,7 @@ class SFTAlgoConfig(BaseAlgoConfig):
 
 AlgoConfig: TypeAlias = Annotated[
     GRPOAlgoConfig
+    | QorlAnchoredGRPOAlgoConfig
     | EchoAlgoConfig
     | MaxRLAlgoConfig
     | RAEAlgoConfig

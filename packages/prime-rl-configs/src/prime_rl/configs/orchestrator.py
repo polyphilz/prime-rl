@@ -8,6 +8,7 @@ from renderers import AutoRendererConfig, RendererConfig
 from prime_rl.configs.algorithm import (
     AlgoConfig,
     GRPOAlgoConfig,
+    QorlAnchoredGRPOAlgoConfig,
 )
 from prime_rl.configs.monitors import OrchestratorMonitorsConfig
 from prime_rl.configs.shared import (
@@ -628,6 +629,19 @@ class OrchestratorConfig(BaseConfig):
             if "group_size" not in env_cfg.model_fields_set:
                 env_cfg.group_size = self.group_size
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_algorithm_group_sizes(self):
+        """Validate algorithms whose credit assumes an exact cohort size."""
+        for env_cfg in self.train.source:
+            algo = env_cfg.algo
+            if isinstance(algo, QorlAnchoredGRPOAlgoConfig) and algo.expected_group_size != env_cfg.group_size:
+                raise ValueError(
+                    "qorl_anchored_grpo expected_group_size must equal "
+                    f"the source group_size ({algo.expected_group_size} != "
+                    f"{env_cfg.group_size})"
+                )
         return self
 
     @model_validator(mode="after")

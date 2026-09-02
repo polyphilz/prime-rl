@@ -8,7 +8,13 @@ from verifiers.v1.graph import MessageNode
 from verifiers.v1.types import AssistantMessage, ToolMessage, UserMessage
 
 from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
-from prime_rl.orchestrator.algo import EchoAlgorithm, assign_advantages, stamp_loss_routing
+from prime_rl.orchestrator.algo import (
+    EchoAlgorithm,
+    QorlAnchoredGRPO,
+    assign_advantages,
+    build_algorithm,
+    stamp_loss_routing,
+)
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.transports.batch.types import TrainingSample
 
@@ -35,6 +41,7 @@ def _ref_kind(ref):
     ("algorithm_type", "build_kwargs", "source", "action_loss_type"),
     [
         ("grpo", {}, "policy", "rl"),
+        ("qorl_anchored_grpo", {}, "policy", "rl"),
         ("max_rl", {}, "policy", "rl"),
         ("opd", {"teacher": FROZEN}, "policy", "ref_kl"),
         ("sft", {"sampling": {"source": FROZEN}}, "frozen", "ce"),
@@ -85,6 +92,30 @@ def test_sft_requires_teacher():
 def test_rl_loss_type_incompatible_with_frozen_sampling():
     with pytest.raises(ValueError, match="sampling.source is a frozen model"):
         _build(type="grpo", sampling={"source": FROZEN})
+
+
+def test_qorl_anchored_grpo_builds_as_a_named_algorithm():
+    config = _build(
+        type="qorl_anchored_grpo",
+        tau=0.04,
+        c=0.08,
+        d=0.01,
+        min_peers=1,
+        expected_group_size=3,
+    )
+
+    algorithm = build_algorithm(config, MagicMock())
+
+    assert isinstance(algorithm, QorlAnchoredGRPO)
+    assert config.model_dump() == {
+        "type": "qorl_anchored_grpo",
+        "sampling": {"source": "policy"},
+        "tau": 0.04,
+        "c": 0.08,
+        "d": 0.01,
+        "min_peers": 1,
+        "expected_group_size": 3,
+    }
 
 
 # --------------------------------------------------------------------------
