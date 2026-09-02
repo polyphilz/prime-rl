@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import verifiers.v1 as vf
@@ -29,6 +29,9 @@ DecisionKind = Literal[
 class QorlDecision:
     kind: DecisionKind
     speedup: float | None = None
+    fingerprint: str | None = None
+    observed_speedup: float | None = None
+    fingerprint_group_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,19 @@ def anchored_advantages(
     return results
 
 
+def measured_decision(kind: DecisionKind, final: dict[str, Any]) -> QorlDecision:
+    fingerprint = final.get("winning_plan_sha256")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError(f"{kind} requires a winning_plan_sha256")
+    speedup = float(final.get("score", 0.1))
+    return QorlDecision(
+        kind,
+        speedup,
+        fingerprint,
+        observed_speedup=speedup,
+    )
+
+
 def decision_from_final(final: dict[str, Any]) -> QorlDecision:
     status = final.get("status")
     source = final.get("score_source")
@@ -96,12 +112,34 @@ def decision_from_final(final: dict[str, Any]) -> QorlDecision:
     if status == "completed" and source == "default_fingerprint":
         return QorlDecision("default_duplicate")
     if status == "completed" and source == "interleaved_measurement":
-        return QorlDecision("candidate", float(final["score"]))
+        return measured_decision("candidate", final)
     if status == "candidate_timeout":
-        return QorlDecision("timeout", float(final.get("score", 0.1)))
+        return measured_decision("timeout", final)
     if status == "no_valid_candidate":
         return QorlDecision("invalid")
     raise ValueError(f"unsupported QORL final result: status={status!r} score_source={source!r}")
+
+
+def share_fingerprint_speedups(decisions: list[QorlDecision]) -> list[QorlDecision]:
+    by_fingerprint: dict[str, list[float]] = {}
+    for decision in decisions:
+        if decision.kind not in {"candidate", "timeout"}:
+            continue
+        if decision.fingerprint is None or decision.speedup is None:
+            raise ValueError(f"{decision.kind} requires fingerprinted speedup evidence")
+        by_fingerprint.setdefault(decision.fingerprint, []).append(decision.speedup)
+
+    shared = {fingerprint: statistics.median(speedups) for fingerprint, speedups in by_fingerprint.items()}
+    return [
+        replace(
+            decision,
+            speedup=shared[decision.fingerprint],
+            fingerprint_group_size=len(by_fingerprint[decision.fingerprint]),
+        )
+        if decision.kind in {"candidate", "timeout"}
+        else decision
+        for decision in decisions
+    ]
 
 
 class QorlAnchoredGRPO(Algorithm):
@@ -129,10 +167,14 @@ class QorlAnchoredGRPO(Algorithm):
         return None
 
     @staticmethod
-    def _record(trace: vf.Trace, result: QorlAdvantage) -> None:
+    def _record(trace: vf.Trace, decision: QorlDecision, result: QorlAdvantage) -> None:
         trace.info["qorl_advantage"] = {
             "rule": "qorl_anchored_grpo",
             "discarded": False,
+            "fingerprint": decision.fingerprint,
+            "observed_speedup": decision.observed_speedup,
+            "shared_speedup": decision.speedup,
+            "fingerprint_group_size": decision.fingerprint_group_size,
             **asdict(result),
         }
 
@@ -174,7 +216,9 @@ class QorlAnchoredGRPO(Algorithm):
             return
 
         try:
-            decisions = [decision_from_final(trace.info["qorl"]["final"]) for trace in trainable]
+            decisions = share_fingerprint_speedups(
+                [decision_from_final(trace.info["qorl"]["final"]) for trace in trainable]
+            )
             results = anchored_advantages(
                 decisions,
                 tau=self.config.tau,
@@ -190,6 +234,6 @@ class QorlAnchoredGRPO(Algorithm):
             self._discard(episodes, trainable, "unsupported_final")
             return
 
-        for trace, result in zip(trainable, results, strict=True):
+        for trace, decision, result in zip(trainable, decisions, results, strict=True):
             assign_advantages(trace, result.advantage)
-            self._record(trace, result)
+            self._record(trace, decision, result)

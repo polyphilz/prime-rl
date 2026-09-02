@@ -15,6 +15,7 @@ from prime_rl.orchestrator.algo.qorl_anchored_grpo import (
     QorlAnchoredGRPO,
     QorlDecision,
     anchored_advantages,
+    share_fingerprint_speedups,
 )
 from prime_rl.orchestrator.algo.routing import assign_advantages
 from prime_rl.orchestrator.trajectories import trace_to_samples
@@ -297,7 +298,12 @@ def test_qorl_anchored_grpo_reads_qorl_final_results():
         [
             {"status": "completed", "score_source": "explicit_keep_default", "score": 1.0},
             {"status": "completed", "score_source": "default_fingerprint", "score": 1.0},
-            {"status": "completed", "score_source": "interleaved_measurement", "score": 1.4},
+            {
+                "status": "completed",
+                "score_source": "interleaved_measurement",
+                "winning_plan_sha256": "candidate-plan",
+                "score": 1.4,
+            },
             {"status": "no_valid_candidate", "score": 0.0},
         ]
     )
@@ -314,6 +320,59 @@ def test_qorl_anchored_grpo_reads_qorl_final_results():
         {"quality": 0.286, "reference": 0.0, "protocol_cost": 0.0, "advantage": 0.286},
         abs=1e-3,
     )
+
+
+def test_qorl_anchored_grpo_shares_speedup_by_non_default_fingerprint():
+    decisions = share_fingerprint_speedups(
+        [
+            QorlDecision("candidate", 1.4, "shared", observed_speedup=1.4),
+            QorlDecision("candidate", 1.2, "shared", observed_speedup=1.2),
+            QorlDecision("candidate", 0.9, "other", observed_speedup=0.9),
+            QorlDecision("invalid"),
+        ]
+    )
+
+    assert [decision.speedup for decision in decisions] == pytest.approx([1.3, 1.3, 0.9, None])
+    assert [decision.fingerprint_group_size for decision in decisions] == [2, 2, 1, 1]
+    assert [decision.observed_speedup for decision in decisions[:2]] == [1.4, 1.2]
+
+
+def test_qorl_anchored_grpo_assigns_equal_advantage_to_equal_fingerprints():
+    group = _qorl_group(
+        [
+            {
+                "status": "completed",
+                "score_source": "interleaved_measurement",
+                "winning_plan_sha256": "shared",
+                "score": 1.4,
+            },
+            {
+                "status": "completed",
+                "score_source": "interleaved_measurement",
+                "winning_plan_sha256": "shared",
+                "score": 1.2,
+            },
+            {
+                "status": "completed",
+                "score_source": "interleaved_measurement",
+                "winning_plan_sha256": "other",
+                "score": 0.9,
+            },
+            {"status": "no_valid_candidate", "score": 0.0},
+        ]
+    )
+
+    advantages = _score_qorl_group(group)
+
+    assert advantages[0] == pytest.approx(advantages[1])
+    first = group[0].traces[0].info["qorl_advantage"]
+    second = group[1].traces[0].info["qorl_advantage"]
+    assert first["observed_speedup"] == 1.4
+    assert second["observed_speedup"] == 1.2
+    assert first["shared_speedup"] == pytest.approx(1.3)
+    assert second["shared_speedup"] == pytest.approx(1.3)
+    assert first["fingerprint_group_size"] == 2
+    assert second["fingerprint_group_size"] == 2
 
 
 def test_qorl_anchored_grpo_discards_incomplete_group():
@@ -345,7 +404,16 @@ def test_qorl_anchored_grpo_discards_group_with_error():
             {
                 "status": "completed",
                 "score_source": "interleaved_measurement",
+                "winning_plan_sha256": "candidate-plan",
                 "score": "not-a-number",
+            },
+        ),
+        (
+            "missing_fingerprint",
+            {
+                "status": "completed",
+                "score_source": "interleaved_measurement",
+                "score": 1.4,
             },
         ),
     ],
