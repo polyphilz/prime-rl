@@ -225,6 +225,9 @@ class QorlAnchoredGRPOAlgoConfig(BaseAlgoConfig):
     d: float = Field(0.02, ge=0, allow_inf_nan=False)
     """Protocol cost applied to a PlanAction that reproduces the default."""
 
+    t: float = Field(0.10, ge=0, allow_inf_nan=False)
+    """Fixed penalty applied to the quality of a timed-out decision."""
+
     min_peers: int = Field(2, ge=1)
     """Minimum valid siblings required to use their mean as a reference."""
 

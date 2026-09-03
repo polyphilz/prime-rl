@@ -181,6 +181,7 @@ def _qorl(decisions: list[QorlDecision]) -> list[float]:
             tau=0.05,
             c=0.10,
             d=0.02,
+            t=0.10,
             min_peers=2,
         )
     ]
@@ -241,7 +242,7 @@ def test_max_rl_mean_normalized():
         ),
         (
             [QorlDecision("timeout", 0.1), *[QorlDecision("candidate", score) for score in (1.05, 1.03, 1.02)]],
-            [-2.253, 0.0, 0.0, 0.0],
+            [-2.353, 0.0, 0.0, 0.0],
         ),
         (
             [QorlDecision("keep_default"), *[QorlDecision("candidate", score) for score in (0.90, 0.80, 0.70)]],
@@ -272,7 +273,7 @@ def test_max_rl_mean_normalized():
                 QorlDecision("candidate", 1.05),
                 QorlDecision("timeout", 0.1),
             ],
-            [0.286, 0.045, 0.0, -2.363],
+            [0.286, 0.045, 0.0, -2.463],
         ),
         (
             [
@@ -291,6 +292,22 @@ def test_max_rl_mean_normalized():
 )
 def test_qorl_anchored_grpo_worked_examples(decisions, expected):
     assert _qorl(decisions) == pytest.approx(expected, abs=1e-3)
+
+
+def test_qorl_anchored_grpo_penalizes_timeout_at_the_same_measured_score():
+    candidate, timeout = anchored_advantages(
+        [
+            QorlDecision("candidate", 1 / 3),
+            QorlDecision("timeout", 1 / 3),
+        ],
+        tau=0.05,
+        c=0.10,
+        d=0.02,
+        t=0.10,
+        min_peers=2,
+    )
+
+    assert timeout.quality == pytest.approx(candidate.quality - 0.10)
 
 
 def test_qorl_anchored_grpo_reads_qorl_final_results():

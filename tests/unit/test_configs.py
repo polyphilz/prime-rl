@@ -293,6 +293,7 @@ def test_qorl_anchored_grpo_group_size_and_parameters_are_resolved():
                 "tau": 0.04,
                 "c": 0.08,
                 "d": 0.01,
+                "t": 0.07,
                 "min_peers": 1,
                 "expected_group_size": 4,
             },
@@ -309,6 +310,7 @@ def test_qorl_anchored_grpo_group_size_and_parameters_are_resolved():
         "tau": 0.04,
         "c": 0.08,
         "d": 0.01,
+        "t": 0.07,
         "min_peers": 1,
         "expected_group_size": 4,
     }

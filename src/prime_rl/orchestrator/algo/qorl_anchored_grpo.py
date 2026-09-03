@@ -49,7 +49,7 @@ def soft_threshold(value: float, tau: float) -> float:
     return min(value + tau, 0.0)
 
 
-def decision_quality(decision: QorlDecision, tau: float) -> float | None:
+def decision_quality(decision: QorlDecision, tau: float, t: float) -> float | None:
     if decision.kind == "invalid":
         return None
     if decision.kind in {"keep_default", "default_duplicate"}:
@@ -57,7 +57,8 @@ def decision_quality(decision: QorlDecision, tau: float) -> float | None:
     if decision.speedup is None or not math.isfinite(decision.speedup) or decision.speedup <= 0:
         raise ValueError(f"{decision.kind} requires a finite positive speedup")
     clipped = min(10.0, max(0.1, decision.speedup))
-    return soft_threshold(math.log(clipped), tau)
+    quality = soft_threshold(math.log(clipped), tau)
+    return quality - t if decision.kind == "timeout" else quality
 
 
 def anchored_advantages(
@@ -66,9 +67,10 @@ def anchored_advantages(
     tau: float,
     c: float,
     d: float,
+    t: float,
     min_peers: int,
 ) -> list[QorlAdvantage]:
-    qualities = [decision_quality(decision, tau) for decision in decisions]
+    qualities = [decision_quality(decision, tau, t) for decision in decisions]
     results: list[QorlAdvantage] = []
     for index, (decision, quality) in enumerate(zip(decisions, qualities, strict=True)):
         if decision.kind == "invalid":
@@ -224,6 +226,7 @@ class QorlAnchoredGRPO(Algorithm):
                 tau=self.config.tau,
                 c=self.config.c,
                 d=self.config.d,
+                t=self.config.t,
                 min_peers=self.config.min_peers,
             )
         except (AttributeError, KeyError, TypeError, ValueError) as error:
