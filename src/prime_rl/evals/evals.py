@@ -13,8 +13,9 @@ inside the handshake until the receiver acknowledges.
 Scheduling reuses the orchestrator pipeline unchanged: an eval-only
 ``Dispatcher`` admits episodes under the adaptive ``ConcurrencyController``,
 fed by the ``InferenceMetricsCollector``'s ``/metrics`` polls. Eval episodes
-are version-pinned measurements, so an overload cut only blocks admission and
-the in-flight pool drains through natural completions.
+are version-pinned measurements. By default, a newer online checkpoint cancels
+unfinished episodes from the prior version; callers can disable this when they need
+every epoch to drain.
 
 Env servers: sources without an explicit ``serve.address`` get an env server
 spawned by the evals process at their derived address; sources with one are
@@ -28,12 +29,15 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 from subprocess import Popen
 
 from prime_rl import monitors
 from prime_rl.configs.evals import EvalsConfig
 from prime_rl.configs.trainer import FileSystemWeightBroadcastConfig
-from prime_rl.orchestrator.clients import AdminClients, InferenceClient
+from prime_rl.evals.ckpt import CheckpointManager
+from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
+from prime_rl.orchestrator.clients import AdminPlane, InferenceClient
 from prime_rl.orchestrator.concurrency import ConcurrencyController
 from prime_rl.orchestrator.dispatcher import Dispatcher, DispatcherMetrics, DispatcherMode
 from prime_rl.orchestrator.envs import EvalEnvs
@@ -47,11 +51,16 @@ from prime_rl.orchestrator.patches import (
 )
 from prime_rl.orchestrator.periodic_logger import PeriodicLogger
 from prime_rl.orchestrator.types import DispatchFailure, EvalBatch, GroupCancellation, Policy
-from prime_rl.orchestrator.utils import eval_work, intercept_vf_logging, set_default_executor
+from prime_rl.orchestrator.utils import (
+    episode_group_id,
+    eval_work,
+    intercept_vf_logging,
+    set_default_executor,
+)
 from prime_rl.transports.weights import WeightReceiver, setup_weight_receiver
 from prime_rl.utils.config import dump_resolved_config
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
-from prime_rl.utils.pathing import get_all_ckpt_steps, get_config_dir, get_log_dir
+from prime_rl.utils.pathing import create_attempt_log_dir, get_all_ckpt_steps, get_config_dir
 from prime_rl.utils.process import DEFAULT_COMMON_ENV_VARS, cleanup_processes
 from prime_rl.utils.utils import clean_exit
 
@@ -67,8 +76,13 @@ STARTUP_BROADCAST_TIMEOUT_S = 1200
 
 
 class Evals:
-    def __init__(self, config: EvalsConfig) -> None:
+    def __init__(self, config: EvalsConfig, log_dir: Path | None = None) -> None:
         self.config = config
+        self.log_dir = log_dir or (
+            Path(os.environ["PRL_LOG_DIR"])
+            if "PRL_LOG_DIR" in os.environ
+            else create_attempt_log_dir(config.output_dir)
+        )
         setup_logger(config.log.level, json_logging=config.log.json_logging)
         intercept_vf_logging(logger="verifiers.v1", level="WARN")
         mode = f"online (broadcasts_dir={config.online.broadcasts_dir})" if config.online is not None else "standalone"
@@ -77,13 +91,15 @@ class Evals:
         # The last weight-checkpoint step already handled (evaluated or skipped).
         self.last_step = (config.online.resume_step if config.online is not None else None) or 0
         self.eval_triggered_at: dict[tuple[str, int], float] = {}
+        self.ckpt_manager = CheckpointManager(config.output_dir)
+        self.last_saved_cursor = 0
         self.env_server_procs: list[Popen] = []
         self.dispatcher_task: asyncio.Task | None = None
 
         # Assigned in setup(); None-initialized so stop() can tear down a
         # partially completed setup with plain attribute checks.
         self.clients: InferenceClient | None = None
-        self.admin_clients: AdminClients | None = None
+        self.admin_plane: AdminPlane | None = None
         self.dispatcher: Dispatcher | None = None
         self.inference_metrics: InferenceMetricsCollector | None = None
         self.periodic_logger: PeriodicLogger | None = None
@@ -109,7 +125,7 @@ class Evals:
 
         get_logger().info(f"Initializing inference pool (base_url={config.eval.client.base_url}, model={config.model})")
         self.clients = InferenceClient(config.eval.client, model_name=config.model)
-        self.admin_clients = AdminClients(config.eval.client)
+        self.admin_plane = AdminPlane(config.eval.client)
 
         self.spawn_env_servers()
 
@@ -119,7 +135,7 @@ class Evals:
         get_logger().success(f"Eval environment(s) ready ({', '.join(self.eval_envs.names)})")
 
         get_logger().info("Waiting for inference pool to be ready")
-        await self.admin_clients.wait_for_ready(config.model)
+        await self.admin_plane.wait_for_ready(config.model)
         get_logger().success("Inference pool ready")
 
         self.receiver: WeightReceiver | None = None
@@ -132,7 +148,7 @@ class Evals:
             self.receiver = setup_weight_receiver(
                 config.online.broadcasts_dir,
                 weight_broadcast,
-                admin_clients=self.admin_clients.clients,
+                admin_plane=self.admin_plane,
                 model_name=config.model,
             )
             await self.receiver.initialize()
@@ -140,6 +156,20 @@ class Evals:
         is_resumed = config.online is not None and config.online.resume_step is not None
         self.eval_source = EvalSource(self.eval_envs, config.eval, is_resumed=is_resumed)
         self.eval_sink = EvalSink(eval_envs=self.eval_envs)
+        if config.resume is not None:
+            if config.resume.dir is not None:
+                resume_step = config.resume.dir_step
+                resume_path = config.resume.dir / "evals"
+            else:
+                resume_step = config.resume.step or self.ckpt_manager.latest_step()
+                resume_path = None
+            self.ckpt_manager.load(
+                resume_step,
+                self.eval_source,
+                path=resume_path,
+            )
+            self.last_saved_cursor = self.eval_source.cursor
+            get_logger().info(f"Resuming evals from task cursor {self.eval_source.cursor}")
         self.policy = Policy(version=0, model_name=config.model)
 
         # Pessimistic per-episode token cost for the controller's starting cap,
@@ -171,7 +201,7 @@ class Evals:
         # The collector always polls — it feeds the concurrency controller;
         # metrics fan out to every registered monitor.
         self.inference_metrics = InferenceMetricsCollector(
-            self.admin_clients.clients,
+            self.admin_plane.clients,
             on_load=self.concurrency.observe,
         )
         # Fail fast when adaptivity has no signal: external API endpoints
@@ -182,7 +212,7 @@ class Evals:
         if not await self.inference_metrics.probe():
             concurrency = config.eval.concurrency
             if concurrency.min_inflight != concurrency.max_inflight:
-                urls = ", ".join(str(client.base_url) for client in self.admin_clients.clients)
+                urls = ", ".join(str(client.base_url) for client in self.admin_plane.clients)
                 raise ValueError(
                     f"No engine metrics at {urls} - adaptive concurrency has no load signal. "
                     "The endpoint does not expose vLLM /metrics (e.g. an external inference API); "
@@ -209,7 +239,7 @@ class Evals:
         config = self.config
         addresses = config.eval.env_addresses
         config_dir = get_config_dir(config.output_dir) / "envs" / "eval"
-        log_dir = get_log_dir(config.output_dir) / "envs" / "eval"
+        log_dir = self.log_dir / "envs" / "eval"
         for source in config.eval.source:
             if source.serve.address is not None:
                 continue
@@ -245,6 +275,8 @@ class Evals:
             await self.maybe_run_evals(step=0)
         else:
             await self.watch()
+
+        self.maybe_save_checkpoint(force=True)
 
         # The periodic logger and the collector log to the W&B run, so they
         # must stop before finalize marks the run finished.
@@ -316,6 +348,20 @@ class Evals:
                 break
             await asyncio.sleep(POLL_INTERVAL_S)
 
+    def next_published_step(self, step: int) -> int | None:
+        """Return the first newer checkpoint offered by the trainer."""
+        assert self.config.online is not None
+        assert self.config.online.broadcasts_dir is not None
+        assert self.receiver is not None
+        return next(
+            (
+                candidate
+                for candidate in get_all_ckpt_steps(self.config.online.broadcasts_dir)
+                if candidate > step and self.receiver.is_published(candidate)
+            ),
+            None,
+        )
+
     def deleted_due_steps(self, steps: list[int], newest_published: int | None) -> set[int]:
         """Eval-due steps up to the newest published broadcast that are missing from
         the broadcasts dir — the trainer wrote them (it broadcasts at every due step),
@@ -350,66 +396,136 @@ class Evals:
             # Every offered version must be received: the trainer blocks inside
             # the handshake, so a failed receive fails the run loudly.
             get_logger().info(f"Updating inference weights to broadcast step {step} ({broadcast_dir})")
+            await self.dispatcher.on_version_pending(step)
             await self.receiver.receive(step)
+            self.policy.version = step
+            await self.dispatcher.on_new_version(step)
 
         if not fired:
             return
+
+        for env_name in fired:
+            task_count = self.eval_source.triggered_task_count(env_name, step)
+            self.eval_sink.set_batch_size(env_name, step, task_count * self.eval_sink.group_size_for(env_name))
 
         now = time.perf_counter()
         for env_name in fired:
             self.eval_triggered_at[(env_name, step)] = now
         total_rollouts = sum(
-            self.eval_envs.get(env_name).config.group_size * len(self.eval_envs.get(env_name).examples)
-            for env_name in fired
+            self.eval_envs.get(request.env_name).config.group_size
+            for request in self.eval_source.queue
+            if request.step == step and request.env_name in fired
         )
 
         # The dispatcher only schedules eval in PREFER_EVAL, so nothing dispatches
         # between the trigger above and the weight reload completing.
-        self.policy.version = step
+        if not reload_weights:
+            self.policy.version = step
         get_logger().info(f"Starting evals in {', '.join(fired)} at step {step} ({total_rollouts} total rollouts)")
         self.dispatcher.switch_mode(DispatcherMode.PREFER_EVAL, reason=f"eval was triggered at step {step}")
-        await self.consume_epoch(fired)
+        await self.consume_epoch(fired, step)
 
-    async def consume_epoch(self, fired: list[str]) -> None:
-        """Consume dispatcher episodes until every fired env's epoch finalizes,
-        routing them through the sink and monitors."""
-        # An env with no examples emits no episodes, so its epoch can never finalize.
-        pending = {env_name for env_name in fired if self.eval_sink.batch_size_for(env_name) > 0}
+    async def consume_epoch(self, fired: list[str], step: int) -> None:
+        """Consume one epoch, preempting it when a newer checkpoint is ready."""
+        pending = {env_name for env_name in fired if self.eval_sink.batch_size_for(env_name, step) > 0}
+        cancellation_task: asyncio.Task[int] | None = None
+        superseding_step: int | None = None
+        online = self.config.online
+
         while pending:
-            item = await self.dispatcher.out_q.get()
+            if (
+                cancellation_task is None
+                and online is not None
+                and self.config.eval.cancel_on_new_checkpoint
+                and (superseding_step := self.next_published_step(step)) is not None
+            ):
+                get_logger().warning(
+                    f"Checkpoint {superseding_step} is ready - cancelling unfinished eval episodes for step {step}"
+                )
+                cancellation_task = asyncio.create_task(
+                    self.dispatcher.cancel_eval_step(step), name=f"cancel-eval-step-{step}"
+                )
+
+            try:
+                if online is not None and self.config.eval.cancel_on_new_checkpoint:
+                    item = await asyncio.wait_for(self.dispatcher.out_q.get(), timeout=POLL_INTERVAL_S)
+                else:
+                    item = await self.dispatcher.out_q.get()
+            except asyncio.TimeoutError:
+                if cancellation_task is not None and cancellation_task.done():
+                    cancellation_task.result()
+                continue
+
             if isinstance(item, GroupCancellation):
-                raise RuntimeError("Eval dispatcher emitted a group cancellation")
-            if isinstance(item, DispatchFailure):
+                eval_batch = self.eval_sink.cancel(item)
+                group_completed = False
+                group_id = item.group_id
+            elif isinstance(item, DispatchFailure):
                 eval_batch = self.eval_sink.fail(item)
+                group_completed = not self.eval_sink.has_pending_group(item.group_id)
+                group_id = item.group_id
             else:
-                step = eval_work(item).step
-                await monitors.log([item], step, "eval", "all")
+                item_step = eval_work(item).step
+                stamp_arrival([item], "eval", item_step)
+                await monitors.log([item], item_step, "eval", "all")
                 eval_batch = self.eval_sink.add(item)
+                group_id = episode_group_id(item)
+                group_completed = not self.eval_sink.has_pending_group(group_id)
             if eval_batch is not None:
                 await self.finalize_eval_batch(eval_batch)
                 pending.discard(eval_batch.env_name)
+            if group_completed:
+                source_index = self.dispatcher.pop_source_index(group_id)
+                if self.config.online is not None:
+                    continue
+                if source_index is None:
+                    raise RuntimeError(f"Eval group {group_id} is missing its source cursor")
+                if self.eval_source.mark_completed(source_index):
+                    self.maybe_save_checkpoint()
+
+        if cancellation_task is not None:
+            cancelled = await cancellation_task
+            get_logger().warning(
+                f"Cancelled {cancelled} unfinished eval episodes for step {step}; "
+                f"advancing to checkpoint {superseding_step}"
+            )
+
+    def maybe_save_checkpoint(self, *, force: bool = False) -> None:
+        if self.config.ckpt is None:
+            return
+        cursor = self.eval_source.cursor
+        if cursor <= 0 or cursor == self.last_saved_cursor:
+            return
+        if not force and cursor - self.last_saved_cursor < self.config.ckpt.interval:
+            return
+        self.ckpt_manager.save(self.eval_source)
+        self.last_saved_cursor = cursor
 
     async def finalize_eval_batch(self, batch: EvalBatch) -> None:
         """Persist + log one completed eval epoch through the monitors, mirroring the
         orchestrator: effective episodes plus the ``eval/{env}/...`` metric dict."""
-        if not batch.episodes and not batch.failures:
+        if not batch.episodes and not batch.failures and not batch.cancelled:
             get_logger().warning(f"Eval @ step={batch.step} env={batch.env_name}: no attempts returned, skipping log")
             return
 
         if batch.episodes.effective:
             await monitors.log(batch.episodes.effective.vf_episodes, batch.step, "eval", "effective")
+            await monitors.log_annotations(stamp_batch(batch.episodes.effective.vf_episodes, batch.step))
 
         episodes = batch.episodes
         effective = episodes.effective
         metrics: dict[str, float] = {}
         for subset, pool in (("all", episodes), ("effective", effective)):
             metrics |= pool.metrics.to_wandb(prefix=f"eval/{batch.env_name}", subset=subset)
-        total_attempts = len(episodes) + len(batch.failures)
+        total_attempts = len(episodes) + len(batch.failures) + batch.cancelled
         metrics |= dispatch_failure_metrics(
             batch.failures,
             prefix=f"eval/{batch.env_name}/all",
             total_attempts=total_attempts,
         )
+        if batch.cancelled:
+            metrics[f"eval/{batch.env_name}/all/cancelled/count"] = float(batch.cancelled)
+            metrics[f"eval/{batch.env_name}/all/cancelled/mean"] = batch.cancelled / total_attempts
         metrics[f"eval/{batch.env_name}/policy_version"] = float(batch.step)
         metrics["step"] = float(batch.step)
         await monitors.log(metrics, step=batch.step)
@@ -417,6 +533,14 @@ class Evals:
         eff, full = effective.metrics, episodes.metrics
         triggered_at = self.eval_triggered_at.pop((batch.env_name, batch.step), None)
         elapsed = (time.perf_counter() - triggered_at) if triggered_at is not None else 0.0
+        if batch.cancelled:
+            get_logger().warning(
+                f"Partially evaluated {batch.env_name} (Step {batch.step}) | "
+                f"{format_time(elapsed):>7} | Reward {eff.reward.mean():.4f} | "
+                f"Error {full.has_error.mean():.1%} | "
+                f"Completed {len(episodes)}/{total_attempts} | Cancelled {batch.cancelled}/{total_attempts}"
+            )
+            return
         get_logger().success(
             f"Evaluated {batch.env_name} (Step {batch.step}) | "
             f"{format_time(elapsed):>7} | Reward {eff.reward.mean():.4f} | "
@@ -455,14 +579,14 @@ class Evals:
             await self.dispatcher.stop()
         if self.clients is not None:
             await self.clients.aclose()
-        if self.admin_clients is not None:
-            await self.admin_clients.aclose()
+        if self.admin_plane is not None:
+            await self.admin_plane.aclose()
         cleanup_processes(self.env_server_procs)
 
 
 @clean_exit
-async def run_evals(config: EvalsConfig) -> None:
-    evals = Evals(config)
+async def run_evals(config: EvalsConfig, log_dir: Path | None = None) -> None:
+    evals = Evals(config, log_dir)
     try:
         await evals.run()
         # Finalize only on a clean exit — a crashed evals must not mark the run completed.
@@ -472,11 +596,9 @@ async def run_evals(config: EvalsConfig) -> None:
 
 
 def main() -> None:
-    from prime_rl.utils.config import cli
-    from prime_rl.utils.process import set_proc_title
+    from prime_rl.entrypoints.evals import main as entrypoint_main
 
-    set_proc_title("Evals")
-    asyncio.run(run_evals(cli(EvalsConfig)))
+    entrypoint_main()
 
 
 if __name__ == "__main__":

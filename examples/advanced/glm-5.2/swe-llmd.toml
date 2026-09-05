@@ -84,7 +84,6 @@ partition = "all" # FILL IN: set to your cluster's partition
 
 [trainer]
 dist_timeout_seconds = 1800
-enable_token_export = true
 
 [trainer.model]
 name = "zai-org/GLM-5.1"
@@ -96,6 +95,9 @@ ep = 8
 
 [trainer.model.quantization]
 type = "fp8"
+
+[trainer.model.moe.compute]
+type = "deepgemm_fp8"
 
 [trainer.model.ac]
 freq = 1

@@ -2,7 +2,7 @@
 
 Hybrid Mamba-Transformer-MoE architecture with three distinct layer types:
 - Mamba-2 layers (using NemotronHMamba2Mixer from HF transformers)
-- LatentMoE layers (non-gated experts with latent projections)
+- MoE layers with non-gated experts and latent projections
 - Attention layers (using shared FlashAttention/SDPA from prime-rl)
 """
 
@@ -19,11 +19,16 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.nemotron_h.modular_nemotron_h import NemotronHMamba2Mixer
 from transformers.utils import auto_docstring, logging
 
-from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
+from prime_rl.trainer.models.base import CPSupport, PreTrainedModelPrimeRL
 from prime_rl.trainer.models.layers.attn import ATTN_IMPL2CLASS, AttentionConfig
 from prime_rl.trainer.models.layers.cp_mamba import mamba_cp_forward
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
-from prime_rl.trainer.models.layers.moe import LatentMoE, NemotronHRouter, NonGatedGroupedExperts
+from prime_rl.trainer.models.layers.mlp import FeedForward
+from prime_rl.trainer.models.layers.moe import (
+    GroupedExperts,
+    MoE,
+    TokenChoiceTopKRouter,
+)
 from prime_rl.trainer.models.layers.rms_norm import RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.ulysses_attn import ULYSSES_PARAMS
 from prime_rl.trainer.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
@@ -233,27 +238,65 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         return residual + hidden_states
 
 
+class NemotronHMoE(MoE):
+    def __init__(self, *, hidden_size: int, latent_size: int, **kwargs):
+        super().__init__(**kwargs)
+        self.fc1_latent_proj = nn.Linear(hidden_size, latent_size, bias=False)
+        self.fc2_latent_proj = nn.Linear(latent_size, hidden_size, bias=False)
+
+    def prepare_expert_input(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc1_latent_proj(x)
+
+    def prepare_expert_output(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2_latent_proj(x)
+
+
 class NemotronHMoELayer(GradientCheckpointingLayer):
-    """MoE layer: norm -> LatentMoE -> residual."""
+    """MoE layer with latent routed experts."""
 
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         self.norm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.layer_norm_epsilon))
-        self.mlp = LatentMoE(
+        effective_latent_dim = config.moe_latent_size if config.moe_latent_size is not None else config.hidden_size
+        router = TokenChoiceTopKRouter(
             dim=config.hidden_size,
-            latent_dim=config.moe_latent_size,
-            moe_intermediate_size=config.moe_intermediate_size,
-            shared_expert_intermediate_size=config.moe_shared_expert_intermediate_size,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
-            n_group=config.n_group,
-            topk_group=config.topk_group,
-            norm_topk_prob=config.norm_topk_prob,
-            routed_scaling_factor=config.routed_scaling_factor,
-            use_grouped_mm=config.use_grouped_mm,
-            load_balance_coeff=config.load_balance_coeff,
-            fp8=getattr(config, "fp8", False),
+            score_func="sigmoid",
+            route_norm=config.norm_topk_prob,
+            route_scale=config.routed_scaling_factor,
+            selection_bias=True,
+            topk_sorted=False,
         )
+        router.fp32_gate = True
+        experts = GroupedExperts(
+            dim=effective_latent_dim,
+            hidden_dim=config.moe_intermediate_size,
+            num_experts=config.n_routed_experts,
+            expert_type="non_gated",
+            activation=config.mlp_hidden_act,
+        )
+        shared_expert = FeedForward(
+            dim=config.hidden_size,
+            hidden_dim=config.moe_shared_expert_intermediate_size,
+            expert_type="non_gated",
+            activation=config.mlp_hidden_act,
+        )
+        moe_kwargs = dict(
+            router=router,
+            experts=experts,
+            shared_expert=shared_expert,
+            score_before_experts=False,
+            load_balance_coeff=config.load_balance_coeff,
+        )
+        if config.moe_latent_size is None:
+            self.mlp = MoE(**moe_kwargs)
+        else:
+            self.mlp = NemotronHMoE(
+                hidden_size=config.hidden_size,
+                latent_size=config.moe_latent_size,
+                **moe_kwargs,
+            )
 
     def forward(
         self,
@@ -335,8 +378,16 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     _can_compile_fullgraph = False
 
     @classmethod
+    def cp_support(cls, config) -> CPSupport:
+        return CPSupport(
+            frozenset({"ulysses"}),
+            "ring CP is a softmax-attention algorithm and cannot run this model's Mamba layers, "
+            "whereas ulysses' all-to-all on Q/K/V leaves the SSM kernel unchanged",
+        )
+
+    @classmethod
     def keep_in_fp32_for_weight_transfer(cls, name: str) -> bool:
-        return name.endswith(("mamba.A_log", "mamba.D", "mlp.router.e_score_correction_bias"))
+        return name.endswith(("mamba.A_log", "mamba.D", "mlp.router.selection_bias"))
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -348,7 +399,7 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, (NonGatedGroupedExperts, NemotronHRouter)):
+        elif isinstance(module, (GroupedExperts, TokenChoiceTopKRouter)):
             module.init_weights(std)
 
     @classmethod
@@ -359,7 +410,7 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
         return any(
             "mamba." in name
-            or "mlp.experts.w1" in name
+            or "mlp.experts.up_proj" in name
             or "self_attn." in name
             or "model.embed_tokens." in name
             or "model.norm." in name

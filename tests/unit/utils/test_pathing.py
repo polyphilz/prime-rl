@@ -2,8 +2,9 @@ import pytest
 
 from prime_rl.utils.pathing import (
     clean_future_steps,
+    create_attempt_dirs,
+    get_batch_dir,
     get_broadcast_dir,
-    get_rollout_dir,
     get_step_path,
     validate_run_dir,
 )
@@ -23,8 +24,13 @@ def test_empty_dir_passes(tmp_path):
 def test_dir_with_launcher_artifacts_passes(tmp_path):
     run_dir = tmp_path / "submitted"
     run_dir.mkdir()
-    (run_dir / "configs").mkdir()
-    (run_dir / "configs" / "trainer.toml").touch()
+    config_dir, log_dir = create_attempt_dirs(run_dir)
+    (config_dir / "trainer.json").touch()
+    next_config_dir, next_log_dir = create_attempt_dirs(run_dir)
+    assert next_config_dir.parent.name == "attempt_2"
+    assert next_log_dir.name == "attempt_2"
+    assert (run_dir / "configs" / "latest").resolve() == next_config_dir.parent
+    assert (run_dir / "logs" / "latest").resolve() == next_log_dir
     (run_dir / "launcher").mkdir()
     (run_dir / "launcher" / "rl.sbatch").touch()
     (run_dir / "launcher" / ".trainer.done").touch()
@@ -97,17 +103,17 @@ def test_clean_outside_output_dir_raises(tmp_path):
 
 
 def test_clean_future_steps_rebuilds_resume_broadcast(tmp_path):
-    rollout_dir = get_rollout_dir(tmp_path)
+    batch_dir = get_batch_dir(tmp_path)
     broadcast_dir = get_broadcast_dir(tmp_path)
-    for parent in (rollout_dir, broadcast_dir):
+    for parent in (batch_dir, broadcast_dir):
         for step in (1, 2, 3):
             get_step_path(parent, step).mkdir(parents=True)
 
     clean_future_steps(tmp_path, resume_step=2)
 
-    assert get_step_path(rollout_dir, 1).exists()
-    assert get_step_path(rollout_dir, 2).exists()
-    assert not get_step_path(rollout_dir, 3).exists()
+    assert get_step_path(batch_dir, 1).exists()
+    assert get_step_path(batch_dir, 2).exists()
+    assert not get_step_path(batch_dir, 3).exists()
     assert get_step_path(broadcast_dir, 1).exists()
     assert not get_step_path(broadcast_dir, 2).exists()
     assert not get_step_path(broadcast_dir, 3).exists()

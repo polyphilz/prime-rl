@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
-
-import verifiers.v1 as vf
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias
 
 from prime_rl.transports.batch import TrainingSample
 
 if TYPE_CHECKING:
+    import verifiers.v1 as vf
+
     from prime_rl.orchestrator.metrics import EvalEpisodes, TrainEpisodes
 
 
@@ -35,7 +35,7 @@ class Progress:
 
 WorkKind = Literal["train", "eval"]
 
-CancelReason = Literal["stale", "overload"]
+CancelReason = Literal["stale", "overload", "superseded"]
 
 
 @dataclass
@@ -43,11 +43,12 @@ class GroupCancellation:
     """Terminal marker for a dropped group: one message covering every episode
     the group still owed the sink (in-flight and never-dispatched), so
     count-to-``group_size`` finalization still fires. ``reason`` distinguishes
-    pipeline decisions (staleness, overload cut) from episode errors."""
+    pipeline decisions (staleness, overload cut, superseded eval) from episode errors."""
 
     kind: WorkKind
     env_name: str
     group_id: str
+    step: int
     count: int
     reason: CancelReason
 
@@ -67,7 +68,10 @@ class DispatchFailure:
     error: vf.Error
 
 
-DispatchResult: TypeAlias = vf.WireEpisode | DispatchFailure | GroupCancellation
+if TYPE_CHECKING:
+    DispatchResult: TypeAlias = vf.WireEpisode | DispatchFailure | GroupCancellation
+else:
+    DispatchResult: TypeAlias = Any
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,7 @@ class TaskRequest:
     env_name: str
     task: vf.Task
     step: int
+    source_index: int | None = None
 
 
 @dataclass
@@ -89,6 +94,7 @@ class InflightEpisode:
     task: vf.Task
     policy_version: int
     step: int
+    source_index: int | None = None
     client_config: vf.ClientConfig | None = None
     started_at: float = 0.0
     """``time.monotonic()`` at dispatch; feeds episode-duration estimates."""
@@ -107,6 +113,7 @@ class GroupState:
     target_episodes: int
     emitted: int = 0
     policy_version_at_start: int = 0
+    source_index: int | None = None
 
 
 @dataclass
@@ -117,6 +124,12 @@ class TrainBatch:
     cohort: TrainEpisodes
     samples: list[TrainingSample]
     failures: list[DispatchFailure]
+    # Episodes with traces retained for a later batch are not discarded.
+    buffered_episode_ids: set[str]
+    # Group cancellations can account for attempts that returned no episode.
+    cancelled_attempts: int = 0
+    # Stale attempts are a subset of cancelled_attempts.
+    stale_attempts: int = 0
 
 
 @dataclass
@@ -131,6 +144,7 @@ class EvalBatch:
     step: int
     episodes: EvalEpisodes
     failures: list[DispatchFailure]
+    cancelled: int = 0
 
 
 class VersionObserver(Protocol):

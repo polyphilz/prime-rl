@@ -20,16 +20,14 @@ from prime_rl.utils.config import cli, dump_resolved_config
 from prime_rl.utils.logger import get_logger, setup_logger
 from prime_rl.utils.pathing import (
     clean_future_steps,
-    create_attempt_log_dir,
     format_log_message,
     get_ckpt_dir,
-    get_config_dir,
     get_launcher_dir,
     get_launcher_log_dir,
-    latest_log_dir,
+    prepare_attempt_dirs,
     resolve_latest_ckpt_step,
     validate_run_dir,
-    write_launch_toml,
+    write_launch_artifacts,
 )
 from prime_rl.utils.process import (
     DEFAULT_COMMON_ENV_VARS,
@@ -123,8 +121,8 @@ def rl_local(config: RLConfig):
         json_logging=config.log.json_logging,
     )
 
-    config_dir = get_config_dir(config.run_dir)
-    write_launch_toml(config.run_dir, "rl")
+    config_dir, log_dir = prepare_attempt_dirs(config.run_dir)
+    write_launch_artifacts(config_dir, "rl")
     write_subconfigs(config, config_dir)
     logger.info(f"Wrote subconfigs to {config_dir}")
 
@@ -178,9 +176,6 @@ def rl_local(config: RLConfig):
                 f"inference.server.port ({expected_port}). "
                 f"Update the base_url to use port {expected_port} to match the inference server."
             )
-
-    # Per-attempt log dir: a resume never overwrites an earlier attempt's logs
-    log_dir = create_attempt_log_dir(config.run_dir)
 
     # Start processes
     processes: list[Popen] = []
@@ -420,7 +415,7 @@ def rl_local(config: RLConfig):
         raise
 
 
-def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) -> None:
+def write_slurm_script(config: RLConfig, config_dir: Path, log_dir: Path, script_path: Path) -> None:
     """Write the SLURM script to disk."""
     from jinja2 import Environment, FileSystemLoader
 
@@ -459,10 +454,27 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
     train_env_names = env_server_names(config, "train")
     eval_env_names = env_server_names(config, "eval")
 
+    nixl_broadcast = (
+        config.weight_broadcast
+        if config.weight_broadcast is not None and config.weight_broadcast.type == "nixl"
+        else None
+    )
+    launch_modelexpress = nixl_broadcast is not None and config.slurm.launch_modelexpress
+    modelexpress_vars = {
+        "use_nixl_broadcast": nixl_broadcast is not None,
+        "launch_modelexpress": launch_modelexpress,
+        "modelexpress_host": nixl_broadcast.host if nixl_broadcast is not None else "",
+        "modelexpress_port": nixl_broadcast.port if nixl_broadcast is not None else 0,
+        "modelexpress_redis_port": 6380 if nixl_broadcast is not None and nixl_broadcast.port == 6379 else 6379,
+    }
+
     if config.deployment.type == "single_node":
         script = template.render(
             **config.slurm.template_vars,
+            **modelexpress_vars,
             config_path=config_dir / RL_CONFIG,
+            config_dir=config_dir,
+            log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
@@ -476,6 +488,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             is_disaggregated=True,
             run_name=config.run.name,
             config_dir=config_dir,
+            log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
@@ -512,6 +525,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             orchestrator_on_inference=config.deployment.orchestrator_on_inference,
             train_env_names=train_env_names,
             eval_env_names=eval_env_names,
+            **modelexpress_vars,
         )
     else:
         script = template.render(
@@ -519,6 +533,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             is_disaggregated=False,
             run_name=config.run.name,
             config_dir=config_dir,  # TODO: should prob have each subconfig path separately
+            log_dir=log_dir,
             output_dir=config.run_dir,
             launcher_dir=get_launcher_dir(config.run_dir),
             launcher_log_dir=get_launcher_log_dir(config.run_dir),
@@ -551,6 +566,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             inference_env_vars=inference_env_vars,
             train_env_names=train_env_names,
             eval_env_names=eval_env_names,
+            **modelexpress_vars,
         )
 
     script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,9 +581,8 @@ def rl_slurm(config: RLConfig):
         config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"), json_logging=config.log.json_logging
     )
 
-    config_dir = get_config_dir(config.run_dir)
-    write_launch_toml(config.run_dir, "rl")
-    log_dir = latest_log_dir(config.run_dir)
+    config_dir, log_dir = prepare_attempt_dirs(config.run_dir)
+    write_launch_artifacts(config_dir, "rl")
 
     if config.deployment.type == "single_node":
         write_config(config, config_dir, exclude={"slurm", "dry_run", "clean"})
@@ -604,7 +619,7 @@ def rl_slurm(config: RLConfig):
         )
 
     script_path = get_launcher_dir(config.run_dir) / RL_SBATCH
-    write_slurm_script(config, config_dir, script_path)
+    write_slurm_script(config, config_dir, log_dir, script_path)
     logger.info(f"Wrote SLURM script to {script_path}")
 
     if config.dry_run:

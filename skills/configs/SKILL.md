@@ -25,8 +25,12 @@ Naming: CLI uses kebab-case (`--vllm.max-model-len`); TOML uses snake_case (`max
 
 ```bash
 uv run rl --help                                  # all fields and defaults
-uv run rl @ rl.toml --dry-run --output-dir /tmp/x --run.name check # write resolved configs (JSON) to /tmp/x/check/configs
+uv run rl @ rl.toml --dry-run --output-dir /tmp/x --run.name check # write resolved JSON to /tmp/x/check/configs/latest
 ```
+
+Each attempt also writes `configs/attempt_<n>/command.txt`. It records the
+shell-safe launch command, including CLI overrides. `configs/latest` points to
+the current attempt.
 
 ## Validators
 
@@ -69,6 +73,8 @@ The `sft` entrypoint takes the same eval shape at the top level for online evals
 
 **Discriminated unions** — set the `type` field to pick the variant (`[orchestrator.algo] type = "max_rl"`). Omit `type` to keep the default variant.
 
+**RL loss** — `[trainer.loss]` defaults to IPO with `eps = 0.1`, `adv_tau = 1.0`, and `kl_tau = 1e-3`. Omit the section to use these defaults. Set `type = "custom"` with `import_path` and optional `kwargs` to load a custom RL loss. The `ce` and `ref_kl` components are fixed.
+
 **Algorithms** — `[orchestrator.algo] type = "grpo" | "qorl_anchored_grpo" | "max_rl" | "rae" | "hierarchical_grpo" | "opd" | "opsd" | "sft" | "echo"` — the type names the algorithm (credit assignment + loss routing, fused), and each type's class defaults are its vetted setting; any other key you set is your own assembly (e.g. `[orchestrator.algo.roles.user] alpha = 0.1` for echo — setting any echo role replaces the whole role table). `qorl_anchored_grpo` is QORL's domain-specific rule and requires its `expected_group_size` to equal the resolved source `group_size`; its constants are `tau`, `c`, `d`, `t`, and `min_peers`. `hierarchical_grpo` is only valid with a proposer-solver env: it compares solvers with attempts on the same proposed problem and proposers with other proposals in the group. There is no preset layer, and no config hook that points at user code — a new algorithm is a named class in the repo (subclass `Algorithm`, register it). Per-source override: `[orchestrator.train.source.algo] type = "opd"` (the source assembles its own algorithm). prime-rl only hosts the trainable policy; frozen models are inline external endpoints on the algorithm, named where the model is used — `[orchestrator.algo.teacher]` for opd (the frozen model scored against), `[orchestrator.algo.sampling.source]` for sft (the model it samples from), each with `name` + `base_url`. There is no shared `teacher` slot. opsd declares no model — it self-distills against the live policy. See `docs/algorithms.md`.
 
 **`BaseModel | None` fields** — bare flag enables defaults; nested override enables and sets:
@@ -79,16 +85,6 @@ The `sft` entrypoint takes the same eval shape at the top level for online evals
 ```
 
 In TOML, an empty section header (`[ckpt]`) does the same.
-
-## RL trainer token exports
-
-For rollout debugging, enable trainer-side token export with `trainer.enable_token_export = true` (or `--enable-token-export` when running the trainer entrypoint directly). It writes one JSONL record per exported sequence under `<run_dir>/token_exports/step_<step>/rank_<rank>.jsonl`. Each record stores aligned per-token arrays for token ids, loss mask, component weight streams (rl/ce/ref_kl), advantages, entropy, mismatch KL, inference/trainer logprobs, importance ratios, probability deltas, and masking diagnostics. It does not decode token text in the trainer.
-
-```toml
-enable_token_export = true
-```
-
-Leave it unset for normal training. When enabled, it exports every sequence from each exporting rank.
 
 ## Key files
 

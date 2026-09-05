@@ -86,12 +86,33 @@ def check_dashboard_smoke(output_dir: Path, run_name: str) -> None:
             # resolved concatenated document renders as a tree
             page.click("#tabs [data-tab=config]")
             page.wait_for_timeout(1500)
+            assert page.locator("#config-attempt-select").input_value() == "latest"
+            assert page.locator("#config-attempt-select option:checked").inner_text().startswith("latest (attempt ")
             assert page.eval_on_selector("#config-view", "e => e.innerText.length") > 100, "config view did not render"
+            command = page.locator("#config-command-text").inner_text()
+            assert command.startswith("uv run "), f"launch command did not render: {command!r}"
+            if page.locator("#config-attempt-select option").count() > 2:
+                latest_config = page.locator("#config-view").inner_text()
+                first_attempt = page.locator("#config-attempt-select option").nth(1).get_attribute("value")
+                page.locator("#config-attempt-select").select_option(first_attempt, force=True)
+                page.wait_for_timeout(1000)
+                assert page.locator("#config-attempt-select").input_value() == first_attempt
+                assert page.locator("#config-view").inner_text() != latest_config
+                earlier_command = page.locator("#config-command-text").inner_text()
+                assert earlier_command.startswith("uv run ")
+                assert earlier_command != command, "attempt selector did not change the launch command"
+                page.locator("#config-attempt-select").select_option("latest", force=True)
+                page.wait_for_timeout(1000)
+                assert page.locator("#config-command-text").inner_text() == command
+            page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base)
+            page.click("#config-command-copy")
+            page.wait_for_function("document.querySelector('#config-command-copy').classList.contains('copied')")
+            assert page.evaluate("navigator.clipboard.readText()") == command
             page.click("#config-format [data-fmt=json]")
             page.wait_for_timeout(1500)
             assert page.locator("#config-view .j-line").count() > 10, "resolved config tree did not render"
 
-            # traces: when the run saved rollouts, episodes must render and open
+            # traces: when the run shipped a cohort, episodes must render and open
             rollout_steps = page.evaluate(
                 f"""fetch('{base}/api/runs/{run_name}/rollouts').then(r => r.json()).then(d => d.steps.length)"""
             )
@@ -106,11 +127,27 @@ def check_dashboard_smoke(output_dir: Path, run_name: str) -> None:
                 assert entries > 0, "episode viewer rendered no messages"
                 reward = page.locator(".tm-reward-big").first.inner_text()
                 assert reward not in ("", "n/a"), f"episode reward did not render: {reward!r}"
+                page.click("#tm-view [data-view=replay]")
+                page.wait_for_timeout(250)
+                assert page.locator(".replay-shell").count() == 1, "terminal replay did not render"
+                assert page.locator("#replay-output .replay-event").count() > 0, "terminal replay showed no events"
+                assert page.locator("#replay-speed").input_value() == "8"
+                page.check("#replay-skip-inference")
+                assert "inference skipped" in page.locator("#replay-timing-badge").inner_text()
+                assert page.locator("#replay-show-thinking").is_checked()
+                page.keyboard.press("t")
+                assert not page.locator("#replay-show-thinking").is_checked()
+                page.keyboard.press("Home")
+                assert page.locator("#replay-top").get_attribute("class").find("active") >= 0
+                page.keyboard.press("End")
+                assert page.locator("#replay-live").get_attribute("class").find("active") >= 0
                 page.keyboard.press("Escape")
 
             # logs: the merged pane shows lines
             page.click("#tabs [data-tab=logs]")
             page.wait_for_timeout(PAGE_SETTLE_MS)
+            assert page.locator("#attempt-select").input_value() == "latest"
+            assert page.locator("#attempt-select option:checked").inner_text().startswith("latest (attempt ")
             log_lines = page.locator(".log-pane .ll").count()
             assert log_lines > 10, f"log pane rendered only {log_lines} lines"
 

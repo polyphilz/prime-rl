@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -161,6 +162,79 @@ def test_cli_overrides_toml(tmp_path):
 def test_removed_fused_lm_head_chunk_size_field_is_rejected():
     with pytest.raises(ValidationError, match="fused_lm_head_chunk_size"):
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
+
+
+def test_moe_runtime_defaults_are_independent_from_dense_quantization():
+    config = TrainerModelConfig.model_validate({"quantization": {"type": "mxfp8"}})
+
+    assert config.quantization is not None and config.quantization.type == "mxfp8"
+    assert config.moe.compute.type == "bf16"
+    assert config.moe.dispatch.type == "torch"
+    assert config.moe.dispatch.transport == "bf16"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"moe": {"compute": {"type": "deepgemm_fp8"}}},
+        {"moe": {"compute": {"type": "mxfp8", "recipe": "mxfp8_rceil_wgrad_with_hp"}}},
+        {"ep": 2, "moe": {"dispatch": {"type": "deepep", "num_sms": 16, "token_chunk_size": 1024}}},
+        {
+            "ep": 2,
+            "moe": {
+                "compute": {"type": "mxfp8"},
+                "dispatch": {"type": "torch", "transport": "mxfp8"},
+            },
+        },
+    ],
+)
+def test_supported_moe_runtime_configs(model):
+    TrainerModelConfig.model_validate(model)
+
+
+@pytest.mark.parametrize(
+    ("model", "message"),
+    [
+        (
+            {
+                "ep": 2,
+                "moe": {
+                    "compute": {"type": "bf16"},
+                    "dispatch": {"type": "torch", "transport": "mxfp8"},
+                },
+            },
+            "MXFP8 transport requires",
+        ),
+        (
+            {
+                "ep": 2,
+                "moe": {
+                    "compute": {"type": "mxfp8"},
+                    "dispatch": {"type": "deepep"},
+                },
+            },
+            "does not support DeepEP",
+        ),
+    ],
+)
+def test_invalid_moe_runtime_configs_fail(model, message):
+    with pytest.raises(ValidationError, match=message):
+        TrainerModelConfig.model_validate(model)
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        {"ep_comm_backend": "torch"},
+        {"deepep_num_sms": 20},
+        {"deepep_token_chunk_size": 1024},
+        {"quantization": {"type": "fp8", "enable_grouped_gemm": True}},
+        {"quantization": {"type": "mxfp8", "enable_a2a": True}},
+    ],
+)
+def test_removed_moe_runtime_fields_are_rejected(removed):
+    with pytest.raises(ValidationError):
+        TrainerModelConfig.model_validate(removed)
 
 
 @pytest.mark.parametrize("config_cls", [TrainerConfig, SFTConfig])
@@ -329,9 +403,52 @@ def test_qorl_anchored_grpo_group_size_and_parameters_are_resolved():
         )
 
 
-def test_trainer_enable_token_export_cli_flag():
-    assert not cli(TrainerConfig, args=[]).enable_token_export
-    assert cli(TrainerConfig, args=["--enable-token-export"]).enable_token_export
+def test_policy_sources_accept_different_top_p_values():
+    with pytest.warns(UserWarning, match="defaulting top_k"):
+        config = OrchestratorConfig.model_validate(
+            {
+                "renderer": {"name": "qwen3"},
+                "train": {
+                    "source": [
+                        {
+                            "name": "top-p-95",
+                            "env": {"taskset": {"id": "reverse-text"}},
+                            "sampling": {"top_p": 0.95},
+                        },
+                        {
+                            "name": "top-p-97",
+                            "env": {"taskset": {"id": "reverse-text"}},
+                            "sampling": {"top_p": 0.97},
+                        },
+                    ]
+                },
+            }
+        )
+
+    assert [source.sampling.top_k for source in config.train.source] == [512, 512]
+
+
+def test_policy_sources_reject_mixed_top_k_capture():
+    with pytest.warns(UserWarning, match="defaulting top_k"):
+        with pytest.raises(ValidationError, match="cannot mix top_k > 0 and top_k = -1"):
+            OrchestratorConfig.model_validate(
+                {
+                    "renderer": {"name": "qwen3"},
+                    "train": {
+                        "source": [
+                            {
+                                "name": "truncated",
+                                "env": {"taskset": {"id": "reverse-text"}},
+                                "sampling": {"top_p": 0.95},
+                            },
+                            {
+                                "name": "untruncated",
+                                "env": {"taskset": {"id": "reverse-text"}},
+                            },
+                        ]
+                    },
+                }
+            )
 
 
 def test_single_node_auto_inference_ports_follow_server_port():
@@ -422,11 +539,6 @@ def test_trainer_rejects_vlm_cp_with_ring():
 
     with pytest.raises(ValidationError, match="cp_style='ulysses'"):
         TrainerConfig.model_validate(config)
-
-
-def test_selective_activation_checkpointing_requires_custom_impl():
-    with pytest.raises(ValidationError, match="Selective activation checkpointing requires model.impl='custom'"):
-        TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
 
 
 def test_shared_model_name_propagates_to_subconfigs():
@@ -805,3 +917,19 @@ def test_explicit_inference_parser_wins_over_auto():
     )
     assert config.inference is not None
     assert config.inference.vllm.tool_call_parser == "hermes"
+
+
+def test_combined_replay_uses_v2_runner(monkeypatch):
+    from prime_rl.inference.server import setup_vllm_env
+
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    config = InferenceConfig(
+        enable_return_sampling_mask=True,
+        vllm={"enable_return_routed_experts": True},
+    )
+
+    setup_vllm_env(config)
+
+    assert config.enable_return_sampling_mask is True
+    assert config.vllm.enable_return_routed_experts is True
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"

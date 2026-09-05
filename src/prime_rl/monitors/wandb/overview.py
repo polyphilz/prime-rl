@@ -33,7 +33,6 @@ OVERVIEW_NAME = "overview"
 # agent. Only the score metric differs — train scores with "reward/mean", eval with "avg@k" (its k
 # dynamic, so also a regex) — and each section builder prepends its own.
 COMMON_METRICS = [
-    "all/dispatch_failure/mean",
     "effective/num_total_tokens/mean",
     "effective/num_turns/mean",
     "effective/num_branches/mean",
@@ -143,6 +142,7 @@ def eval_section(name: str, env_pattern: str) -> ws.Section:
     return section(
         name,
         regexes=[f"eval/{env_pattern}/all/[^/]+/avg@.*", f"eval/{env_pattern}/effective/[^/]+/avg@.*"]
+        + [f"eval/{env_pattern}/all/cancelled/mean"]
         + [f"eval/{env_pattern}/{m}" for m in COMMON_METRICS]
         + [f"eval/{env_pattern}/{r}" for r in COMMON_REGEXES],
     )

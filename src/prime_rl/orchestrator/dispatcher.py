@@ -18,7 +18,7 @@
   the weight update) drops train groups already past ``max_off_policy_steps`` — a
   compute-saving early cancel; the sink's queue sweep is what guarantees the
   bound. Eval episodes are measurements for the policy version they started
-  with, so they are allowed to finish even if training advances. Train
+  with. Online evals may explicitly cancel them when a newer checkpoint is ready. Train
   episodes sampled from a frozen model never go stale — their generation
   source doesn't change with policy updates.
 """
@@ -190,6 +190,7 @@ class Dispatcher:
 
         self.inflight: dict[asyncio.Task, InflightEpisode] = {}
         self.groups: dict[uuid.UUID, GroupState] = {}
+        self.source_indices_by_group: dict[str, int] = {}
 
         # Bounded so the dispatcher backpressures on a slow sink (unbounded
         # when no hard ceiling is configured — the dynamic cap still bounds
@@ -466,6 +467,8 @@ class Dispatcher:
             return False
         gid = uuid.uuid4()
         self.groups[gid] = fresh
+        if fresh.source_index is not None:
+            self.source_indices_by_group[str(gid)] = fresh.source_index
         return await self.schedule_group_episode(gid, fresh)
 
     def next_fresh_group(self, kind: WorkKind, envs) -> GroupState | None:
@@ -493,7 +496,11 @@ class Dispatcher:
             episodes_to_schedule=group_size,
             target_episodes=group_size,
             policy_version_at_start=self.policy.version,
+            source_index=request.source_index,
         )
+
+    def pop_source_index(self, group_id: str) -> int | None:
+        return self.source_indices_by_group.pop(group_id, None)
 
     async def schedule_group_episode(self, group_id: uuid.UUID, group: GroupState) -> bool:
         """Dispatch one ``run`` task for this group.
@@ -545,6 +552,7 @@ class Dispatcher:
             task=group.task,
             policy_version=group.policy_version_at_start,
             step=group.step,
+            source_index=group.source_index,
             client_config=client,
             started_at=time.monotonic(),
         )
@@ -702,6 +710,7 @@ class Dispatcher:
                     kind=kind,
                     env_name=env_name,
                     group_id=str(group_id),
+                    step=group.step if group is not None else claimed[-1][1].step,
                     count=cancelled,
                     reason=reason,
                 )
@@ -709,6 +718,7 @@ class Dispatcher:
 
         if claimed:
             await safe_cancel_all([task for task, _ in claimed])
+        self.source_indices_by_group.pop(str(group_id), None)
         return cancelled
 
     async def cancel_inflight_episodes(self) -> None:
@@ -720,6 +730,7 @@ class Dispatcher:
         tasks = list(self.inflight.keys())
         self.inflight.clear()
         self.groups.clear()
+        self.source_indices_by_group.clear()
         if tasks:
             await safe_cancel_all(tasks)
 
@@ -743,6 +754,40 @@ class Dispatcher:
             self.groups.pop(gid, None)
         if train_tasks:
             await safe_cancel_all(train_tasks)
+        return cancelled
+
+    async def cancel_eval_step(self, step: int) -> int:
+        """Cancel queued and active eval groups for a superseded checkpoint.
+
+        Scheduling remains paused until ``on_new_version`` runs after the
+        replacement weights are live.
+        """
+        if self.eval_source is None or self.eval_envs is None:
+            return 0
+
+        self.policy_update_pending = True
+        async with self.scheduling_lock:
+            queued = self.eval_source.cancel_step(step)
+            group_ids = [gid for gid, group in self.groups.items() if group.kind == "eval" and group.step == step]
+
+        cancelled = 0
+        for group_id in group_ids:
+            cancelled += await self.drop_group(group_id, reason="superseded")
+
+        for request in queued:
+            count = self.eval_envs.get(request.env_name).config.group_size
+            cancelled += count
+            self.metrics.record_cancellation(kind="eval", env_name=request.env_name, n=count)
+            await self.out_q.put(
+                GroupCancellation(
+                    kind="eval",
+                    env_name=request.env_name,
+                    group_id=str(uuid.uuid4()),
+                    step=request.step,
+                    count=count,
+                    reason="superseded",
+                )
+            )
         return cancelled
 
     # ── metrics ────────────────────────────────────────────────────────────
