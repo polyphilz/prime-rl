@@ -204,17 +204,12 @@ def train(config: TrainerConfig):
 
             substitute_hf_ulysses_attn(cp_group)
             substitute_ulysses_attn(cp_group, attn_impl=config.model.attn)
-        from prime_rl.utils.cp import (
-            assert_cp_style_supports_model,
-            setup_model_cp,
-            setup_sparse_mla_cp,
-        )
+        from prime_rl.utils.cp import setup_model_cp, setup_sparse_mla_cp
 
-        assert_cp_style_supports_model(config.model.cp_style, model)
         # sparse MLA is softmax (works with both ring and ulysses).
         setup_sparse_mla_cp(model, cp_group, cp_rank, parallel_dims.cp)
-        # Linear-attn / Mamba layers are only configured under ulysses; with ring
-        # we'd have already raised above.
+        # Linear-attn / Mamba layers are only configured under ulysses; models that have them
+        # declare ulysses-only in `cp_support`, so `get_model` already rejected ring.
         if config.model.cp_style == "ulysses":
             setup_model_cp(model, cp_group, cp_rank, parallel_dims.cp)
 
@@ -258,7 +253,9 @@ def train(config: TrainerConfig):
         )
     logger.debug(f"Initialized data loader in {format_time(time.perf_counter() - t0)}")
 
-    annotation_writer = AnnotationWriter(parallel_dims, world)
+    annotation_writer = AnnotationWriter(
+        parallel_dims, world, config.monitors.file.float_decimals if config.monitors.file else None
+    )
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
 
@@ -763,6 +760,7 @@ def train(config: TrainerConfig):
 
     logger.info(f"Peak memory: {max_peak_memory:.1f} GiB")
     logger.success("RL trainer finished")
+    asyncio.run(monitors.finalize())
 
     # Stop metrics/health server if configured
     if metrics_server is not None:

@@ -8,7 +8,13 @@ from verifiers.v1.graph import MessageNode
 from verifiers.v1.types import AssistantMessage, ToolMessage, UserMessage
 
 from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
-from prime_rl.orchestrator.algo import EchoAlgorithm, assign_advantages, stamp_loss_routing
+from prime_rl.orchestrator.algo import (
+    EchoAlgorithm,
+    QorlAnchoredGRPO,
+    assign_advantages,
+    build_algorithm,
+    stamp_loss_routing,
+)
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.transports.batch.types import TrainingSample
 
@@ -35,6 +41,7 @@ def _ref_kind(ref):
     ("algorithm_type", "build_kwargs", "source", "action_loss_type"),
     [
         ("grpo", {}, "policy", "rl"),
+        ("qorl_anchored_grpo", {}, "policy", "rl"),
         ("max_rl", {}, "policy", "rl"),
         ("opd", {"teacher": FROZEN}, "policy", "ref_kl"),
         ("sft", {"sampling": {"source": FROZEN}}, "frozen", "ce"),
@@ -85,6 +92,31 @@ def test_sft_requires_teacher():
 def test_rl_loss_type_incompatible_with_frozen_sampling():
     with pytest.raises(ValueError, match="sampling.source is a frozen model"):
         _build(type="grpo", sampling={"source": FROZEN})
+
+
+def test_qorl_anchored_grpo_builds_as_a_named_algorithm():
+    config = _build(
+        type="qorl_anchored_grpo",
+        tau=0.04,
+        c=0.08,
+        d=0.01,
+        min_peers=1,
+        expected_group_size=3,
+    )
+
+    algorithm = build_algorithm(config, MagicMock())
+
+    assert isinstance(algorithm, QorlAnchoredGRPO)
+    assert config.model_dump() == {
+        "type": "qorl_anchored_grpo",
+        "sampling": {"source": "policy"},
+        "tau": 0.04,
+        "c": 0.08,
+        "d": 0.01,
+        "t": 0.10,
+        "min_peers": 1,
+        "expected_group_size": 3,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +243,93 @@ def test_assign_advantages_full_length_stream():
     trace = _make_episode().traces[0]
     assign_advantages(trace, [0.5, -0.5, 1.0])
     assert trace_to_samples(trace)[0].advantages == [0.0, 0.0, 0.5, -0.5, 0.0, 1.0]
+
+
+def test_compaction_retries_train_only_causally_used_generations():
+    nodes = [
+        MessageNode(
+            parent=None,
+            message=UserMessage(content="work"),
+            sampled=False,
+            token_ids=[1],
+            mask=[False],
+        ),
+        MessageNode(
+            parent=0,
+            message=AssistantMessage(content="evidence"),
+            sampled=True,
+            token_ids=[2],
+            mask=[True],
+            logprobs=[-0.1],
+        ),
+        MessageNode(
+            parent=1,
+            message=UserMessage(content="summarize"),
+            sampled=False,
+            token_ids=[3],
+            mask=[False],
+        ),
+        MessageNode(
+            parent=2,
+            semantic_parents=[vf.ParentLink(node=1, type="compaction_attempt")],
+            message=AssistantMessage(content="rejected tool call"),
+            sampled=True,
+            token_ids=[4],
+            mask=[True],
+            logprobs=[-0.2],
+        ),
+        MessageNode(
+            parent=2,
+            semantic_parents=[vf.ParentLink(node=1, type="compaction_attempt")],
+            message=AssistantMessage(content="accepted summary"),
+            sampled=True,
+            token_ids=[5],
+            mask=[True],
+            logprobs=[-0.3],
+        ),
+        MessageNode(
+            parent=None,
+            message=UserMessage(content="compacted context"),
+            sampled=False,
+            token_ids=[6],
+            mask=[False],
+        ),
+        MessageNode(
+            parent=5,
+            semantic_parents=[vf.ParentLink(node=4, type="compaction")],
+            message=AssistantMessage(content="answer"),
+            sampled=True,
+            token_ids=[7],
+            mask=[True],
+            logprobs=[-0.4],
+        ),
+    ]
+    trace = vf.Trace(
+        task=vf.TraceTask(type="Task", data=vf.TaskData(idx=0, prompt=None)),
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        nodes=nodes,
+        rewards={},
+        ok=True,
+    )
+    branches = {branch.nodes[-1].message.content: branch for branch in trace.branches}
+    assert branches["rejected tool call"].trainable is False
+    assert branches["accepted summary"].trainable is True
+    assert branches["answer"].trainable is True
+
+    assign_advantages(trace, 1.0)
+    assert trace.nodes[1].advantages == [1.0]
+    assert trace.nodes[3].advantages is None
+    assert trace.nodes[4].advantages == [1.0]
+    assert trace.nodes[6].advantages == [1.0]
+
+    trainable_ids = [
+        token_id
+        for sample in trace_to_samples(trace)
+        for token_id, trainable in zip(sample.token_ids, sample.mask, strict=True)
+        if trainable
+    ]
+
+    assert sorted(trainable_ids) == [2, 5, 7]
 
 
 def test_assign_advantages_slices_across_nodes():

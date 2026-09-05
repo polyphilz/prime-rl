@@ -357,6 +357,52 @@ def test_env_algo_overrides_top_level():
         )
 
 
+def test_qorl_anchored_grpo_group_size_and_parameters_are_resolved():
+    config = OrchestratorConfig.model_validate(
+        {
+            "renderer": {"name": "qwen3"},
+            "group_size": 4,
+            "algo": {
+                "type": "qorl_anchored_grpo",
+                "tau": 0.04,
+                "c": 0.08,
+                "d": 0.01,
+                "t": 0.07,
+                "min_peers": 1,
+                "expected_group_size": 4,
+            },
+            "train": {"source": [{"env": {"taskset": {"id": "reverse-text"}}}]},
+        }
+    )
+
+    resolved = config.train.source[0]
+    assert resolved.group_size == 4
+    assert resolved.algo is not None
+    assert resolved.algo.model_dump() == {
+        "sampling": {"source": "policy"},
+        "type": "qorl_anchored_grpo",
+        "tau": 0.04,
+        "c": 0.08,
+        "d": 0.01,
+        "t": 0.07,
+        "min_peers": 1,
+        "expected_group_size": 4,
+    }
+
+    with pytest.raises(ValidationError, match="expected_group_size must equal"):
+        OrchestratorConfig.model_validate(
+            {
+                "renderer": {"name": "qwen3"},
+                "group_size": 4,
+                "algo": {
+                    "type": "qorl_anchored_grpo",
+                    "expected_group_size": 3,
+                },
+                "train": {"source": [{"env": {"taskset": {"id": "reverse-text"}}}]},
+            }
+        )
+
+
 def test_policy_sources_accept_different_top_p_values():
     with pytest.warns(UserWarning, match="defaulting top_k"):
         config = OrchestratorConfig.model_validate(
