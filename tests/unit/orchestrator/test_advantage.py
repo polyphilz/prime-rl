@@ -15,7 +15,8 @@ from prime_rl.orchestrator.algo.qorl_anchored_grpo import (
     QorlAnchoredGRPO,
     QorlDecision,
     anchored_advantages,
-    share_fingerprint_speedups,
+    decision_from_final,
+    share_reusable_speedups,
 )
 from prime_rl.orchestrator.algo.routing import assign_advantages
 from prime_rl.orchestrator.trajectories import trace_to_samples
@@ -190,7 +191,15 @@ def _qorl(decisions: list[QorlDecision]) -> list[float]:
 def _qorl_group(finals: list[dict]) -> list[vf.Episode]:
     group = _make_group([0.0] * len(finals))
     for episode, final in zip(group, finals, strict=True):
-        episode.traces[0].info["qorl"] = {"final": final}
+        episode.traces[0].info["qorl"] = {
+            "schema_version": 2,
+            "task_id": "task",
+            "database_pool": {
+                "config_sha256": "pool",
+                "postgres_config": {"id": "pg", "pg_conf_sha256": "pg-conf", "expected_sha256": "pg-expected"},
+            },
+            "final": final,
+        }
     return group
 
 
@@ -313,15 +322,16 @@ def test_qorl_anchored_grpo_penalizes_timeout_at_the_same_measured_score():
 def test_qorl_anchored_grpo_reads_qorl_final_results():
     group = _qorl_group(
         [
-            {"status": "completed", "score_source": "explicit_keep_default", "score": 1.0},
-            {"status": "completed", "score_source": "default_fingerprint", "score": 1.0},
+            {"kind": "kept_default", "speedup": 1.0},
+            {"kind": "default_duplicate", "speedup": 1.0},
             {
-                "status": "completed",
-                "score_source": "interleaved_measurement",
-                "winning_plan_sha256": "candidate-plan",
-                "score": 1.4,
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "candidate-plan",
+                "timing_reuse_key": "candidate-plan",
+                "speedup": 1.4,
             },
-            {"status": "no_valid_candidate", "score": 0.0},
+            {"kind": "no_valid_candidate", "speedup": None},
         ]
     )
 
@@ -340,7 +350,7 @@ def test_qorl_anchored_grpo_reads_qorl_final_results():
 
 
 def test_qorl_anchored_grpo_shares_speedup_by_non_default_fingerprint():
-    decisions = share_fingerprint_speedups(
+    decisions = share_reusable_speedups(
         [
             QorlDecision("candidate", 1.4, "shared", observed_speedup=1.4),
             QorlDecision("candidate", 1.2, "shared", observed_speedup=1.2),
@@ -350,7 +360,7 @@ def test_qorl_anchored_grpo_shares_speedup_by_non_default_fingerprint():
     )
 
     assert [decision.speedup for decision in decisions] == pytest.approx([1.3, 1.3, 0.9, None])
-    assert [decision.fingerprint_group_size for decision in decisions] == [2, 2, 1, 1]
+    assert [decision.reuse_group_size for decision in decisions] == [2, 2, 1, 1]
     assert [decision.observed_speedup for decision in decisions[:2]] == [1.4, 1.2]
 
 
@@ -358,24 +368,27 @@ def test_qorl_anchored_grpo_assigns_equal_advantage_to_equal_fingerprints():
     group = _qorl_group(
         [
             {
-                "status": "completed",
-                "score_source": "interleaved_measurement",
-                "winning_plan_sha256": "shared",
-                "score": 1.4,
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "shared",
+                "timing_reuse_key": "shared",
+                "speedup": 1.4,
             },
             {
-                "status": "completed",
-                "score_source": "interleaved_measurement",
-                "winning_plan_sha256": "shared",
-                "score": 1.2,
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "shared",
+                "timing_reuse_key": "shared",
+                "speedup": 1.2,
             },
             {
-                "status": "completed",
-                "score_source": "interleaved_measurement",
-                "winning_plan_sha256": "other",
-                "score": 0.9,
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "other",
+                "timing_reuse_key": "other",
+                "speedup": 0.9,
             },
-            {"status": "no_valid_candidate", "score": 0.0},
+            {"kind": "no_valid_candidate", "speedup": None},
         ]
     )
 
@@ -388,12 +401,83 @@ def test_qorl_anchored_grpo_assigns_equal_advantage_to_equal_fingerprints():
     assert second["observed_speedup"] == 1.2
     assert first["shared_speedup"] == pytest.approx(1.3)
     assert second["shared_speedup"] == pytest.approx(1.3)
-    assert first["fingerprint_group_size"] == 2
-    assert second["fingerprint_group_size"] == 2
+    assert first["reuse_group_size"] == 2
+    assert second["reuse_group_size"] == 2
+
+
+def test_qorl_anchored_grpo_clips_before_sharing_but_records_raw_speedup():
+    decisions = [
+        decision_from_final(
+            {
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "same-plan",
+                "timing_reuse_key": "same-key",
+                "speedup": speedup,
+            }
+        )
+        for speedup in (20.0, 0.2)
+    ]
+    shared = share_reusable_speedups(decisions)
+    assert [item.speedup for item in shared] == pytest.approx([5.1, 5.1])
+    assert [item.observed_speedup for item in shared] == [20.0, 0.2]
+
+
+def test_qorl_anchored_grpo_does_not_share_unknown_planning_timeouts():
+    finals = [
+        {
+            "kind": "timed_out",
+            "selected_candidate_id": "candidate-01",
+            "selected_plan_sha256": None,
+            "timing_reuse_key": None,
+            "speedup": None,
+            "initial_default_median_execution_time_ms": baseline,
+            "timeout_ms": 5000,
+        }
+        for baseline in (1000.0, 2000.0)
+    ]
+    decisions = share_reusable_speedups([decision_from_final(final) for final in finals])
+    assert [item.speedup for item in decisions] == [0.2, 0.4]
+    assert [item.observed_speedup for item in decisions] == [None, None]
+    assert [item.reuse_group_size for item in decisions] == [1, 1]
+
+
+def test_qorl_anchored_grpo_does_not_share_different_overrides():
+    decisions = [
+        decision_from_final(
+            {
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "same-plan",
+                "timing_reuse_key": key,
+                "speedup": speedup,
+            }
+        )
+        for key, speedup in (("settings-a", 1.4), ("settings-b", 1.2))
+    ]
+    assert [item.speedup for item in share_reusable_speedups(decisions)] == [1.4, 1.2]
+
+
+@pytest.mark.parametrize("changed", ["task", "pool", "postgres", "failure"])
+def test_qorl_anchored_grpo_discards_unscored_or_different_measurement_scopes(changed):
+    group = _qorl_group([{"kind": "kept_default", "speedup": 1.0}] * 4)
+    record = group[0].traces[0].info["qorl"]
+    if changed == "task":
+        record["task_id"] = "other"
+    elif changed == "pool":
+        record["database_pool"]["config_sha256"] = "other"
+    elif changed == "postgres":
+        record["database_pool"]["postgres_config"]["pg_conf_sha256"] = "other"
+    else:
+        record["final"] = None
+        record["failure"] = {"error": "default query timed out"}
+    assert _score_qorl_group(group) == [0.0] * 4
+    expected = "unscored_failure" if changed == "failure" else "mismatched_measurement_scope"
+    assert all(episode.traces[0].info["qorl_advantage"]["discard_reason"] == expected for episode in group)
 
 
 def test_qorl_anchored_grpo_discards_incomplete_group():
-    group = _qorl_group([{"status": "completed", "score_source": "interleaved_measurement", "score": 1.4}] * 3)
+    group = _qorl_group([{"kind": "measured", "selected_candidate_id": "candidate-01", "speedup": 1.4}] * 3)
 
     advantages = _score_qorl_group(group)
 
@@ -402,7 +486,7 @@ def test_qorl_anchored_grpo_discards_incomplete_group():
 
 
 def test_qorl_anchored_grpo_discards_group_with_error():
-    group = _qorl_group([{"status": "completed", "score_source": "interleaved_measurement", "score": 1.4}] * 4)
+    group = _qorl_group([{"kind": "measured", "selected_candidate_id": "candidate-01", "speedup": 1.4}] * 4)
     group[0].traces[0].ok = False
 
     advantages = _score_qorl_group(group)
@@ -415,28 +499,29 @@ def test_qorl_anchored_grpo_discards_group_with_error():
     ("case", "bad_final"),
     [
         ("missing", None),
-        ("unknown_status", {"status": "unknown"}),
+        ("unknown_kind", {"kind": "unknown"}),
         (
             "invalid_score",
             {
-                "status": "completed",
-                "score_source": "interleaved_measurement",
-                "winning_plan_sha256": "candidate-plan",
-                "score": "not-a-number",
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "selected_plan_sha256": "candidate-plan",
+                "timing_reuse_key": "candidate-plan",
+                "speedup": "not-a-number",
             },
         ),
         (
             "missing_fingerprint",
             {
-                "status": "completed",
-                "score_source": "interleaved_measurement",
-                "score": 1.4,
+                "kind": "measured",
+                "selected_candidate_id": "candidate-01",
+                "speedup": 1.4,
             },
         ),
     ],
 )
 def test_qorl_anchored_grpo_discards_unsupported_final(case, bad_final):
-    group = _qorl_group([{"status": "completed", "score_source": "interleaved_measurement", "score": 1.4}] * 4)
+    group = _qorl_group([{"kind": "measured", "selected_candidate_id": "candidate-01", "speedup": 1.4}] * 4)
     if case == "missing":
         group[0].traces[0].info["qorl"].pop("final")
     else:

@@ -68,7 +68,7 @@ type = "grpo"  # the default
 | `type` | Sampling | Loss | What it is |
 |---|---|---|---|
 | `grpo` | policy | `rl` on actions | Standard group-relative RL. |
-| `qorl_anchored_grpo` | policy | `rl` on actions | QORL's anchored group-relative rule: speedups for identical non-default plan fingerprints are first replaced by their group median, clipped log-speedup is soft-thresholded, valid siblings provide a non-negative reference, invalid and timed-out decisions receive fixed penalties, and exact default duplicates pay a small protocol cost. Incomplete, errored, or malformed-protocol groups receive zero advantage. |
+| `qorl_anchored_grpo` | policy | `rl` on actions | QORL's anchored group-relative rule: clip each speedup, share the median for matching timing-reuse keys, then soft-threshold log-speedup. Valid siblings provide a non-negative reference; invalid, timeout, and default-duplicate decisions have explicit penalties. Incomplete, errored, or malformed-protocol groups receive zero advantage. |
 | `max_rl` | policy | `rl` on actions | MaxRL ([arXiv:2602.02710](https://arxiv.org/abs/2602.02710)): GRPO's centered reward normalized by the group **mean** instead of the standard deviation — the gradient is unbiased for the order-`group_size` truncation of the maximum-likelihood objective, upweighting hard examples like `1/p`. |
 | `rae` | policy | `rl` on actions | RAE (SPIRAL, [arXiv:2506.24119](https://arxiv.org/abs/2506.24119)): reward minus a per-agent EMA baseline of that agent's own rewards — the estimator for multi-agent self-play envs, where the group mean would mix the agents' opposite reward scales. See [Self-Play Advantage](#self-play-advantage-rae). |
 | `hierarchical_grpo` | policy | `rl` on actions | GRPO for proposer-solver envs. Solvers are compared only with attempts on the same proposed problem; proposers are compared with the other proposals in the group. See [Hierarchical GRPO](#hierarchical-grpo). |
@@ -286,6 +286,24 @@ The per-token training signal is set by `algo.type` and the [algorithm](#the-alg
 | `opd` | `ref_kl` | On-policy distillation: per-token reverse KL to a reference model (`teacher`, an inline frozen hosted model), evaluated in the trainer from shipped reference logprobs. No credit — rollouts keep `advantages = None` and ship no advantage stream; `group_size` only fans out sampling. |
 | `opsd` | `ref_kl` | SDFT: per-token reverse KL to a demo-conditioned reference. No credit — rollouts keep `advantages = None` and ship no advantage stream. |
 | `sft` | `ce` | Cross-entropy on the sampled tokens. Assigns no advantage — trains on every sampled token. |
+
+### QORL Anchored Advantage
+
+QORL's algorithm reads one finalized `kind` from `trace.info["qorl"]["final"]`:
+`kept_default`, `default_duplicate`, `measured`, `timed_out`, or
+`no_valid_candidate`. It consumes schema-version-2 records; it does not infer the
+decision from attempt history or old score fields. Default and infrastructure
+failures are unscored and discard the group.
+
+Measured speedup is the raw default/candidate median ratio. A timeout has no
+observed speedup: credit uses its initial default median divided by the actual
+candidate cutoff. Each value is clipped to `[0.1, 10]` before sharing, then the
+existing log threshold and anchored reference apply. Sharing requires the same
+task, PostgreSQL/pool configuration and `timing_reuse_key` (full plan plus
+overrides), not merely the same physical structure. Planning timeouts with no
+plan identity remain independent. Sharing changes training credit, never stored
+measurements or performance reporting; earlier failed attempts do not add extra
+anchored penalties to a successfully selected final candidate.
 
 ### Default Advantage
 

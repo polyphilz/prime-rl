@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import verifiers.v1 as vf
+from pydantic import BaseModel, ConfigDict, Field
 
 from prime_rl.configs.algorithm import QorlAnchoredGRPOAlgoConfig
 from prime_rl.orchestrator.algo.base import Algorithm, iter_trainable_traces
@@ -14,6 +15,9 @@ from prime_rl.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from prime_rl.orchestrator.clients import InferenceClient
+
+MIN_TRAINING_SPEEDUP = 0.1
+MAX_TRAINING_SPEEDUP = 10.0
 
 
 DecisionKind = Literal[
@@ -29,9 +33,9 @@ DecisionKind = Literal[
 class QorlDecision:
     kind: DecisionKind
     speedup: float | None = None
-    fingerprint: str | None = None
+    timing_reuse_key: str | None = None
     observed_speedup: float | None = None
-    fingerprint_group_size: int = 1
+    reuse_group_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,7 @@ def decision_quality(decision: QorlDecision, tau: float, t: float) -> float | No
         return 0.0
     if decision.speedup is None or not math.isfinite(decision.speedup) or decision.speedup <= 0:
         raise ValueError(f"{decision.kind} requires a finite positive speedup")
-    clipped = min(10.0, max(0.1, decision.speedup))
+    clipped = min(MAX_TRAINING_SPEEDUP, max(MIN_TRAINING_SPEEDUP, decision.speedup))
     quality = soft_threshold(math.log(clipped), tau)
     return quality - t if decision.kind == "timeout" else quality
 
@@ -93,52 +97,99 @@ def anchored_advantages(
     return results
 
 
-def measured_decision(kind: DecisionKind, final: dict[str, Any]) -> QorlDecision:
-    fingerprint = final.get("winning_plan_sha256")
-    if not isinstance(fingerprint, str) or not fingerprint:
-        raise ValueError(f"{kind} requires a winning_plan_sha256")
-    speedup = float(final.get("score", 0.1))
-    return QorlDecision(
-        kind,
-        speedup,
-        fingerprint,
-        observed_speedup=speedup,
-    )
+class FinalEvidence(BaseModel):
+    """Only the finalized measurement fields consumed by credit assignment."""
+
+    model_config = ConfigDict(extra="ignore", strict=True, allow_inf_nan=False)
+    kind: Literal["kept_default", "default_duplicate", "measured", "timed_out", "no_valid_candidate"]
+    speedup: float | None
+    selected_candidate_id: str | None = None
+    selected_plan_sha256: str | None = None
+    timing_reuse_key: str | None = None
+    initial_default_median_execution_time_ms: float | None = Field(default=None, gt=0)
+    timeout_ms: int | None = Field(default=None, gt=0)
+
+
+class PostgresScope(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+    id: str
+    pg_conf_sha256: str
+    expected_sha256: str
+
+
+class PoolScope(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+    config_sha256: str
+    postgres_config: PostgresScope
+
+
+class RolloutScope(BaseModel):
+    """Sharing is confined to one query and a fixed database/resource configuration."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+    schema_version: Literal[2]
+    task_id: str
+    database_pool: PoolScope
 
 
 def decision_from_final(final: dict[str, Any]) -> QorlDecision:
-    status = final.get("status")
-    source = final.get("score_source")
-    if status == "completed" and source == "explicit_keep_default":
-        return QorlDecision("keep_default")
-    if status == "completed" and source == "default_fingerprint":
-        return QorlDecision("default_duplicate")
-    if status == "completed" and source == "interleaved_measurement":
-        return measured_decision("candidate", final)
-    if status == "candidate_timeout":
-        return measured_decision("timeout", final)
-    if status == "no_valid_candidate":
+    evidence = FinalEvidence.model_validate(final)
+    if evidence.kind in {"kept_default", "default_duplicate"}:
+        if evidence.speedup != 1.0:
+            raise ValueError("default reuse requires speedup 1.0")
+        return QorlDecision("keep_default" if evidence.kind == "kept_default" else "default_duplicate")
+    if evidence.kind == "no_valid_candidate":
+        if evidence.speedup is not None:
+            raise ValueError("no_valid_candidate cannot have a measured speedup")
         return QorlDecision("invalid")
-    raise ValueError(f"unsupported QORL final result: status={status!r} score_source={source!r}")
+    if not evidence.selected_candidate_id:
+        raise ValueError("selected outcome requires a candidate ID")
+    if evidence.kind == "measured":
+        if not evidence.selected_plan_sha256 or not evidence.timing_reuse_key:
+            raise ValueError("measured outcome requires plan identity and timing_reuse_key")
+        if evidence.speedup is None or evidence.speedup <= 0:
+            raise ValueError("measured outcome requires a finite positive speedup")
+        speedup = evidence.speedup
+        kind: DecisionKind = "candidate"
+    else:
+        if evidence.speedup is not None:
+            raise ValueError("timed_out cannot claim a measured speedup")
+        if evidence.initial_default_median_execution_time_ms is None or evidence.timeout_ms is None:
+            raise ValueError("timed_out requires its initial baseline and cutoff")
+        if (evidence.selected_plan_sha256 is None) != (evidence.timing_reuse_key is None):
+            raise ValueError("timeout plan and timing-reuse identity must both be present or absent")
+        speedup = evidence.initial_default_median_execution_time_ms / evidence.timeout_ms
+        kind = "timeout"
+    # Clip each rollout before sharing, then apply the log threshold to the shared value.
+    return QorlDecision(
+        kind,
+        min(MAX_TRAINING_SPEEDUP, max(MIN_TRAINING_SPEEDUP, speedup)),
+        evidence.timing_reuse_key,
+        observed_speedup=evidence.speedup,
+    )
 
 
-def share_fingerprint_speedups(decisions: list[QorlDecision]) -> list[QorlDecision]:
-    by_fingerprint: dict[str, list[float]] = {}
+def share_reusable_speedups(decisions: list[QorlDecision]) -> list[QorlDecision]:
+    by_reuse_key: dict[str, list[float]] = {}
     for decision in decisions:
         if decision.kind not in {"candidate", "timeout"}:
             continue
-        if decision.fingerprint is None or decision.speedup is None:
-            raise ValueError(f"{decision.kind} requires fingerprinted speedup evidence")
-        by_fingerprint.setdefault(decision.fingerprint, []).append(decision.speedup)
+        if decision.speedup is None:
+            raise ValueError(f"{decision.kind} requires speedup evidence")
+        if decision.timing_reuse_key is None:
+            if decision.kind == "timeout":
+                continue
+            raise ValueError("measured candidate requires a timing-reuse key")
+        by_reuse_key.setdefault(decision.timing_reuse_key, []).append(decision.speedup)
 
-    shared = {fingerprint: statistics.median(speedups) for fingerprint, speedups in by_fingerprint.items()}
+    shared = {timing_reuse_key: statistics.median(speedups) for timing_reuse_key, speedups in by_reuse_key.items()}
     return [
         replace(
             decision,
-            speedup=shared[decision.fingerprint],
-            fingerprint_group_size=len(by_fingerprint[decision.fingerprint]),
+            speedup=shared[decision.timing_reuse_key],
+            reuse_group_size=len(by_reuse_key[decision.timing_reuse_key]),
         )
-        if decision.kind in {"candidate", "timeout"}
+        if decision.kind in {"candidate", "timeout"} and decision.timing_reuse_key is not None
         else decision
         for decision in decisions
     ]
@@ -173,10 +224,10 @@ class QorlAnchoredGRPO(Algorithm):
         trace.info["qorl_advantage"] = {
             "rule": "qorl_anchored_grpo",
             "discarded": False,
-            "fingerprint": decision.fingerprint,
+            "timing_reuse_key": decision.timing_reuse_key,
             "observed_speedup": decision.observed_speedup,
             "shared_speedup": decision.speedup,
-            "fingerprint_group_size": decision.fingerprint_group_size,
+            "reuse_group_size": decision.reuse_group_size,
             **asdict(result),
         }
 
@@ -185,10 +236,9 @@ class QorlAnchoredGRPO(Algorithm):
         qorl = trace.info.get("qorl")
         final = qorl.get("final") if isinstance(qorl, dict) else None
         if not isinstance(final, dict):
-            return {"status": None, "score_source": None}
+            return {"kind": None}
         return {
-            "status": final.get("status"),
-            "score_source": final.get("score_source"),
+            "kind": final.get("kind"),
         }
 
     def _discard(
@@ -218,7 +268,14 @@ class QorlAnchoredGRPO(Algorithm):
             return
 
         try:
-            decisions = share_fingerprint_speedups(
+            scopes = [RolloutScope.model_validate(trace.info["qorl"]) for trace in trainable]
+            if any(scope != scopes[0] for scope in scopes[1:]):
+                self._discard(episodes, trainable, "mismatched_measurement_scope")
+                return
+            if any(trace.info["qorl"].get("failure") is not None for trace in trainable):
+                self._discard(episodes, trainable, "unscored_failure")
+                return
+            decisions = share_reusable_speedups(
                 [decision_from_final(trace.info["qorl"]["final"]) for trace in trainable]
             )
             results = anchored_advantages(
