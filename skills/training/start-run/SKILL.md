@@ -81,6 +81,8 @@ With validation configured, prepared training validates after every completed
 epoch; `val.eval_on_start` evaluates incoming weights at step zero. Validation
 steps identify completed optimizer updates. Resume requires all optimizer,
 scheduler, progress, dataloader and per-rank RNG checkpoint state.
+Check resumed optimizer moments as well as weights and row position: state-only
+CPU offload must apply the loaded DCP optimizer state before moving it back to CPU.
 
 ## `inference` — vLLM server
 

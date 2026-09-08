@@ -159,3 +159,59 @@ def test_prepared_config_does_not_require_renderer(config):
 def test_conversation_validation_keeps_its_existing_default_type():
     validation = SFTValConfig.model_validate({"data": {"name": "conversation-dataset"}})
     assert validation.data.type == "sft"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="optimizer offload requires CUDA")
+@pytest.mark.parametrize("warmup", [False, True])
+def test_offloaded_optimizer_checkpoint_restores_moments_and_next_update(tmp_path, warmup):
+    import torch.distributed as dist
+    from torch.distributed.checkpoint import load, save
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor
+
+    from prime_rl.trainer.ckpt import AppState, Progress
+    from prime_rl.trainer.optim.state_offload import CPUOffloadOptimizer
+
+    def setup():
+        model = torch.nn.Linear(2, 1, device="cuda", dtype=torch.bfloat16)
+        fully_shard(model)
+        optimizer = CPUOffloadOptimizer(torch.optim.AdamW(model.parameters(), lr=0.01))
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer.base_optimizer, start_factor=1 / 3 if warmup else 1.0, total_iters=4
+        )
+        progress = Progress(step=1, total_samples=8)
+        return model, optimizer, scheduler, progress
+
+    def step(model, optimizer, scheduler, gradient):
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, gradient)
+        optimizer.step()
+        optimizer.zero_grad()
+        scheduler.step()
+
+    dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    try:
+        model, optimizer, scheduler, progress = setup()
+        step(model, optimizer, scheduler, 0.25)
+        checkpoint = tmp_path / "checkpoint"
+        save({"app": AppState(model, [optimizer], scheduler, progress)}, checkpoint_id=checkpoint)
+        resumed, resumed_optimizer, resumed_scheduler, resumed_progress = setup()
+        load(
+            {"app": AppState(resumed, [resumed_optimizer], resumed_scheduler, resumed_progress)},
+            checkpoint_id=checkpoint,
+        )
+        assert resumed_progress == progress
+        assert resumed_scheduler.state_dict() == scheduler.state_dict()
+        assert resumed_optimizer.param_groups[0]["lr"] == optimizer.param_groups[0]["lr"]
+        for actual, expected in zip(resumed_optimizer.state.values(), optimizer.state.values()):
+            for name in ("step", "exp_avg", "exp_avg_sq"):
+                actual_value = actual[name].to_local() if isinstance(actual[name], DTensor) else actual[name]
+                expected_value = expected[name].to_local() if isinstance(expected[name], DTensor) else expected[name]
+                assert actual_value.device.type == "cpu"
+                torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
+        step(model, optimizer, scheduler, 0.5)
+        step(resumed, resumed_optimizer, resumed_scheduler, 0.5)
+        for actual, expected in zip(resumed.parameters(), model.parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()

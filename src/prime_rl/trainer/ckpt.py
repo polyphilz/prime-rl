@@ -19,7 +19,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from prime_rl.configs.shared import ResumeConfig
 from prime_rl.configs.trainer import CheckpointConfig
-from prime_rl.trainer.optim import OffloadOptimizer, OptimizerLike
+from prime_rl.trainer.optim import FullCPUOffloadOptimizer, OffloadOptimizer, OptimizerLike
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import format_time, get_logger
 from prime_rl.utils.utils import get_all_ckpt_steps, get_ckpt_dir, get_step_path
@@ -105,8 +105,8 @@ class AppState(Stateful):
         checkpoint_optimizers = self._get_checkpoint_optimizers()
         has_cpu_offload = self._has_cpu_offload()
 
-        if has_cpu_offload:
-            # When CPU offload is on, the optimizer is already loaded by the time we
+        if any(isinstance(optimizer, FullCPUOffloadOptimizer) for optimizer in self.optimizers):
+            # With full CPU offload, the optimizer is already loaded by the time we
             # get here: state_dict() handed dcp_load a template whose tensors share
             # storage with optim.state[p][k], and dcp_load wrote the checkpoint bytes
             # directly into those tensors via target_tensor.copy_(...). Running
@@ -122,12 +122,17 @@ class AppState(Stateful):
                 if isinstance(optimizer, OffloadOptimizer):
                     optimizer.finish_checkpoint_load()
         else:
+            # State-only offload relocates its tensors while constructing the DCP
+            # template, so the loaded values must be applied to the optimizer.
             set_state_dict(
                 self.model,
                 checkpoint_optimizers,
                 model_state_dict=state_dict["model"],
                 optim_state_dict=state_dict["optimizers"],
             )
+            for optimizer in self.optimizers:
+                if isinstance(optimizer, OffloadOptimizer):
+                    optimizer.finish_checkpoint_load()
 
         if self.scheduler is not None:
             self.scheduler.load_state_dict(state_dict["scheduler"])
