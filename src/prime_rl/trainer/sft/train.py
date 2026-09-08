@@ -42,6 +42,7 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.sft.data import (
     get_dataset_progress,
+    get_dataset_state,
     load_sft_dataset,
     setup_dataloader,
     setup_dataset,
@@ -264,16 +265,10 @@ def train(config: SFTConfig):
             scheduler = setup_scheduler(optimizer, config.scheduler, scheduler_steps, config.optim.lr)
         logger.info(
             f"Resuming from step {checkpoint_step} (total_tokens={progress.total_tokens}, "
-            f"total_samples={progress.total_samples})"
+            f"total_samples={progress.total_samples}, dataset_state={get_dataset_state(dataloader)})"
         )
     else:
         logger.info("Starting from scratch")
-
-    if config.max_steps is not None and progress.step > config.max_steps:
-        logger.info("Checkpoint already completed the training schedule")
-        if gradient_manager is not None:
-            gradient_manager.close()
-        return
 
     # Create the iterator only after a potential resume: iter() forks workers with a
     # copy of the dataset's *current* state, so a later load_state_dict never reaches
@@ -473,7 +468,7 @@ def train(config: SFTConfig):
         prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
         maybe_record_function = record_function  # noqa: F841 – captured by run_forward_loop closure
     max_peak_memory = 0.0
-    while config.max_steps is None or progress.step <= config.max_steps:
+    while True:
         # Reset peak memory stats
         torch.cuda.reset_peak_memory_stats()
         if gc_handler is not None:
