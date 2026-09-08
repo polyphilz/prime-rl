@@ -128,6 +128,7 @@ def train(config: TrainerConfig):
 
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
+    torch.manual_seed(config.seed)
 
     # Check for checkpoint to resume from
     checkpoint_step = None
@@ -216,7 +217,7 @@ def train(config: TrainerConfig):
     # Fresh adapter init after FSDP materialization (the pretrained checkpoint
     # carries no adapter weights); a checkpoint resume below overwrites it.
     if config.model.lora is not None:
-        get_lora_state().reset_adapter_parameters()
+        get_lora_state().reset_adapter_parameters(seed=config.seed)
 
     # Optionally, resume training from a checkpoint
     progress = Progress()

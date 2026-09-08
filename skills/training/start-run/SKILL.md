@@ -37,6 +37,11 @@ SLURM launches write generated scripts and coordination files under `<run_dir>/l
 
 Launches inference server, orchestrator, and trainer as subprocesses.
 
+Set `trainer.seed` (default 42) for fresh model and LoRA initialization. Every
+distributed rank uses the same seed, including the adapter reset after FSDP
+materialization. This controls initialization; asynchronous rollout scheduling
+does not become deterministic.
+
 ```bash
 uv run rl @ examples/basic/reverse-text/rl.toml
 uv run rl @ examples/basic/reverse-text/rl.toml --dry-run                                # write scripts, don't run

@@ -608,6 +608,9 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 
 
 class TrainerConfig(BaseConfig):
+    seed: int = Field(default=42, ge=0)
+    """Shared initialization seed across model-parallel and replicated ranks."""
+
     model: ModelConfig = ModelConfig()
 
     tokenizer: TokenizerConfig = TokenizerConfig()

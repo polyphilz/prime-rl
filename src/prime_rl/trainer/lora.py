@@ -72,8 +72,11 @@ class LoRAState:
             state_dict = self._adapter_state_dict_converter(state_dict)
         return state_dict
 
-    def reset_adapter_parameters(self) -> None:
+    def reset_adapter_parameters(self, *, seed: int | None = None) -> None:
         """Reset the adapter to fresh initialization across all registered modules."""
+        if seed is not None:
+            # DTensor uses PyTorch's generator state; all participating ranks share this seed.
+            torch.manual_seed(seed)
         for _, module in self._modules:
             module.reset_parameters(0)
 
