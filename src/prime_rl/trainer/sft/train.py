@@ -42,10 +42,17 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.sft.data import (
     get_dataset_progress,
-    get_dataset_state,
     load_sft_dataset,
     setup_dataloader,
     setup_dataset,
+)
+from prime_rl.trainer.sft.prepared import (
+    PreparedDataset,
+    gradient_scale,
+    load_rng,
+    prepared_dataloader,
+    save_rng,
+    validation_mode,
 )
 from prime_rl.trainer.utils import (
     GarbageCollection,
@@ -73,6 +80,23 @@ import torch.distributed as dist
 def train(config: SFTConfig):
     # Setup world and logger
     world = get_world()
+    prepared = None
+    if config.data.type == "prepared":
+        prepared = PreparedDataset(config.data, world.rank // config.model.cp, world.world_size // config.model.cp)
+        if config.max_steps is not None and config.max_steps != len(prepared):
+            raise ValueError("prepared max_steps must equal epochs * ceil(rows / batch_size)")
+        config.max_steps = len(prepared)
+        torch.manual_seed(config.data.seed)
+        if config.resume is not None and config.ckpt is not None:
+            if any(
+                (
+                    config.ckpt.skip_optimizer,
+                    config.ckpt.skip_scheduler,
+                    config.ckpt.skip_progress,
+                    config.ckpt.skip_dataloader,
+                )
+            ):
+                raise ValueError("prepared resume requires optimizer, scheduler, progress and dataloader state")
     logger = setup_logger(
         config.log.level,
         json_logging=config.log.json_logging,
@@ -182,7 +206,7 @@ def train(config: SFTConfig):
     # can still be used to benchmark step time / memory. Validation data is
     # always real, so it needs the renderer even when training data is fake.
     renderer = None
-    if config.data.type != "fake" or config.val is not None:
+    if config.data.type == "sft" or (config.val is not None and config.val.data.type == "sft"):
         renderer = create_renderer(tokenizer, config.renderer)
         if processor is not None and hasattr(renderer, "_processor"):
             renderer._processor = processor
@@ -216,11 +240,14 @@ def train(config: SFTConfig):
     # Set up the dataset and dataloader
     logger.info(f"Initializing data ({config.data})")
     multimodal = config.model.vlm is not None
-    dataset = setup_dataset(tokenizer, config.data, config.model.cp, renderer=renderer, multimodal=multimodal)
-    dataloader = setup_dataloader(dataset, config.data)
+    if prepared is not None:
+        dataloader = prepared_dataloader(prepared)
+    else:
+        dataset = setup_dataset(tokenizer, config.data, config.model.cp, renderer=renderer, multimodal=multimodal)
+        dataloader = setup_dataloader(dataset, config.data)
 
     val_raw_dataset = None
-    if config.val is not None:
+    if config.val is not None and config.val.data.type == "sft":
         logger.info(f"Loading validation dataset ({config.val.data.name})")
         val_raw_dataset = load_sft_dataset(config.val.data)
 
@@ -247,16 +274,27 @@ def train(config: SFTConfig):
             scheduler = setup_scheduler(optimizer, config.scheduler, scheduler_steps, config.optim.lr)
         logger.info(
             f"Resuming from step {checkpoint_step} (total_tokens={progress.total_tokens}, "
-            f"total_samples={progress.total_samples}, dataset_state={get_dataset_state(dataloader)})"
+            f"total_samples={progress.total_samples})"
         )
     else:
         logger.info("Starting from scratch")
+
+    if config.max_steps is not None and progress.step > config.max_steps:
+        logger.info("Checkpoint already completed the training schedule")
+        if gradient_manager is not None:
+            gradient_manager.close()
+        return
 
     # Create the iterator only after a potential resume: iter() forks workers with a
     # copy of the dataset's *current* state, so a later load_state_dict never reaches
     # an already-running worker (the run silently restarts the data from the beginning
     # and re-saves the stale position).
     dataiter = iter(dataloader)
+    if prepared is not None and checkpoint_step is not None:
+        checkpoint_path = (
+            config.resume.dir / "trainer" if config.resume.dir else ckpt_manager.get_ckpt_path(checkpoint_step)
+        )
+        load_rng(checkpoint_path / f"rng_rank_{world.rank}.pt")
 
     cp_enabled = parallel_dims.cp_enabled
     cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
@@ -378,19 +416,29 @@ def train(config: SFTConfig):
         return mean_loss, nan_count.item()
 
     def run_validation(step: int) -> None:
-        val_dataset = setup_dataset(
-            tokenizer,
-            config.val.data,
-            config.model.cp,
-            max_epochs=1,
-            raw_dataset=val_raw_dataset,
-            renderer=renderer,
-            multimodal=multimodal,
-        )
-        val_dataloader = setup_dataloader(val_dataset, config.val.data)
-
-        # No train/eval switch: no dropout in these models, and toggling would trigger torch.compile recompilation
-        mean_loss, nan_count = run_eval_loop(val_dataloader)
+        if config.val.data.type == "prepared":
+            val_dataset = PreparedDataset(
+                config.val.data.model_copy(update={"epochs": 1, "shuffle": False}),
+                world.rank // config.model.cp,
+                world.world_size // config.model.cp,
+            )
+            val_dataloader = prepared_dataloader(val_dataset)
+            batches = (batch for step_batch in val_dataloader for batch in step_batch.micro_batches)
+        else:
+            val_dataset = setup_dataset(
+                tokenizer,
+                config.val.data,
+                config.model.cp,
+                max_epochs=1,
+                raw_dataset=val_raw_dataset,
+                renderer=renderer,
+                multimodal=multimodal,
+            )
+            val_dataloader = setup_dataloader(val_dataset, config.val.data)
+            batches = iter(val_dataloader)
+        # Validation must neither accumulate gradients nor consume training dropout randomness.
+        with validation_mode(model):
+            mean_loss, nan_count = run_eval_loop(batches)
         if nan_count > 0:
             logger.warning(f"Validation at step {step}: {nan_count} batches had NaN loss")
         if mean_loss != mean_loss:
@@ -433,13 +481,14 @@ def train(config: SFTConfig):
 
     logger.info(f"Starting training loop (max_steps={config.max_steps or 'infinite'})")
     max_memory = torch.cuda.mem_get_info()[1] / 1024**3  # GiB
-    is_first_step = True
+    if config.val is not None and config.val.eval_on_start and checkpoint_step is None:
+        run_validation(0)
     if config.trace_path:
         logger.info(f"Tracing to {config.trace_path}")
         prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
         maybe_record_function = record_function  # noqa: F841 – captured by run_forward_loop closure
     max_peak_memory = 0.0
-    while True:
+    while config.max_steps is None or progress.step <= config.max_steps:
         # Reset peak memory stats
         torch.cuda.reset_peak_memory_stats()
         if gc_handler is not None:
@@ -464,23 +513,28 @@ def train(config: SFTConfig):
             if is_moe_model
             else {}
         )
+        prepared_step = next(dataiter) if prepared is not None else None
+        if prepared_step is not None:
+            grad_accum_steps = len(prepared_step.micro_batches)
         run_validation_this_step = config.val is not None and (
-            (is_first_step and config.val.eval_on_start)
-            or (not is_first_step and progress.step % config.val.interval == 0)
+            progress.step % (prepared.steps_per_epoch if prepared is not None else config.val.interval) == 0
+            or is_last_step
+        )
+        micro_batches = (
+            prepared_step.micro_batches
+            if prepared_step is not None
+            else (next(dataiter) for _ in range(grad_accum_steps))
         )
         if gradient_manager is None:
-            micro_batches = (next(dataiter) for _ in range(grad_accum_steps))
             step_local_token_count = torch.tensor(0, dtype=torch.int64, device="cuda")
         else:
-            micro_batches = [next(dataiter) for _ in range(grad_accum_steps)]
+            micro_batches = list(micro_batches)
             local_token_count = sum(int(micro_batch["loss_mask"].sum()) for micro_batch in micro_batches)
             global_step_token_count = torch.tensor(local_token_count, dtype=torch.int64, device="cuda")
             dist.all_reduce(global_step_token_count, op=dist.ReduceOp.SUM, group=dp_cp_group)
             global_token_count_val = global_step_token_count.item() // cp_size
-            grad_scale = (
-                parallel_dims.fsdp_gradient_divide_factor * grad_accum_steps / global_token_count_val
-                if global_token_count_val > 0
-                else 1.0
+            grad_scale = gradient_scale(
+                global_token_count_val, grad_accum_steps, parallel_dims.fsdp_gradient_divide_factor
             )
             prepare_gradient_offload(
                 gradient_manager,
@@ -531,13 +585,10 @@ def train(config: SFTConfig):
             dist.all_reduce(global_step_token_count, op=dist.ReduceOp.SUM, group=dp_cp_group)
             global_token_count_val = global_step_token_count.item()
             if global_token_count_val > 0:
-                grad_scale = parallel_dims.fsdp_gradient_divide_factor * grad_accum_steps / global_token_count_val
+                grad_scale = gradient_scale(
+                    global_token_count_val, grad_accum_steps, parallel_dims.fsdp_gradient_divide_factor
+                )
                 scale_gradients_(None, model, grad_scale)
-
-        # Run validation after forward-backward (so torch.compile sees training graph first) but before
-        # optimizer step (so eval_on_start evaluates untrained weights)
-        if run_validation_this_step:
-            run_validation(progress.step)
 
         # Compute the global mean loss for logging.
         dist.all_reduce(step_loss_sum, op=dist.ReduceOp.SUM, group=dp_cp_group)
@@ -560,6 +611,27 @@ def train(config: SFTConfig):
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
 
+        if run_validation_this_step:
+            run_validation(progress.step)
+
+        # Update durable progress before saving the checkpoint for these weights.
+        if prepared_step is not None:
+            num_tokens = len(prepared_step.row_indices) * config.data.seq_len
+            progress.total_samples += len(prepared_step.row_indices)
+            dataset_progress = {
+                "epoch": prepared_step.epoch + (progress.step % prepared.steps_per_epoch == 0),
+                "num_samples": {},
+                "num_tokens": {},
+            }
+            logger.info(
+                f"Prepared rows | Step {progress.step} | Epoch {prepared_step.epoch} | Rows {prepared_step.row_indices}"
+            )
+        else:
+            num_tokens = config.data.seq_len * config.data.batch_size
+            dataset_progress = get_dataset_progress(dataloader)
+            progress.total_samples = dataset_progress["step"]
+        progress.total_tokens += num_tokens
+
         # Checkpoint the step we just finished. The last step's checkpoint is written once after
         # the loop, so skip it here to avoid a double-save. Weight broadcasts land at
         # online-eval steps — they are how the inference server picks up the new policy.
@@ -569,6 +641,8 @@ def train(config: SFTConfig):
             logger.info(f"Saving checkpoint at step {progress.step}")
             save_ckpt_start_time = time.perf_counter()
             ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress, dataloader=dataloader)
+            if prepared is not None:
+                save_rng(ckpt_manager.get_ckpt_path(progress.step) / f"rng_rank_{world.rank}.pt")
             save_ckpt_time += time.perf_counter() - save_ckpt_start_time
 
             ckpt_manager.maybe_clean()
@@ -589,12 +663,6 @@ def train(config: SFTConfig):
         # training tokens per step is dp_size * (batch_per_dp_rank * seq).
         # The `dp` mesh excludes cp by construction (parallel_dims.py), mirroring
         # the RL trainer's accounting (rl/train.py).
-        dp_size = parallel_dims.get_mesh("dp").size()
-        num_local_tokens = config.data.seq_len * (config.data.batch_size // dp_size)
-        num_tokens = dp_size * num_local_tokens
-        progress.total_tokens += num_tokens
-        dataset_progress = get_dataset_progress(dataloader)
-        progress.total_samples = dataset_progress["step"]
         perf_counter = get_perf_counter(model, config.data.seq_len)
         perf_counter.count_tokens(num_tokens)
         throughput = perf_counter.get_tokens_per_second() or 0
@@ -663,6 +731,7 @@ def train(config: SFTConfig):
             "loss/mean": batch_loss,
             "loss/perplexity": math.exp(min(batch_loss, 20)),
             "loss/nan_count": nan_loss_count,
+            "loss/supervised_tokens": global_token_count_val,
             "step": progress.step,
         }
         # Log tensor stats
@@ -687,8 +756,6 @@ def train(config: SFTConfig):
         if moe_log_metrics:
             asyncio.run(monitors.log({**moe_log_metrics, "step": progress.step}, step=progress.step))
 
-        is_first_step = False
-
         # Send heartbeat if configured
         if heart is not None:
             heart.beat()
@@ -709,6 +776,8 @@ def train(config: SFTConfig):
     if config.ckpt is not None:
         logger.info(f"Saving final checkpoint at step {progress.step}")
         ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress, dataloader=dataloader)
+        if prepared is not None:
+            save_rng(ckpt_manager.get_ckpt_path(progress.step) / f"rng_rank_{world.rank}.pt")
         ckpt_manager.maybe_clean()
 
     # Broadcast the final weights so the evals process can run its forced final epoch

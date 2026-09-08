@@ -72,6 +72,16 @@ uv run sft @ examples/basic/reverse-text/sft.toml --dry-run
 - SLURM: single- and multi-node
 - Multi-node online evals use one SLURM job with `num_train_nodes + num_infer_nodes` nodes. The generated `launcher/sft.sbatch` assigns inference nodes first, then trainer nodes.
 
+Prepared text rows use `data.type = "prepared"`, `data.path` (JSONL), and
+`data.epochs`. Each row supplies `input_ids`, already-shifted `target_ids`,
+`loss_mask`, `position_ids`, and `seq_lens`; no rendering or packing is performed.
+The optimizer consumes the smaller last batch in each epoch without repeating
+rows. Set `max_steps` to `epochs * ceil(rows / batch_size)` or omit it.
+With validation configured, prepared training validates after every completed
+epoch; `val.eval_on_start` evaluates incoming weights at step zero. Validation
+steps identify completed optimizer updates. Resume requires all optimizer,
+scheduler, progress, dataloader and per-rank RNG checkpoint state.
+
 ## `inference` — vLLM server
 
 OpenAI-compatible API plus prime-rl custom endpoints (`/update_weights`, `/load_lora_adapter`, `/init_broadcaster`). Always use this entrypoint — never `vllm serve` directly. It starts a `vllm-router` on `server.port` (default 8000, the client-facing URL) fronting the engine on `backend_port` (default 8100); admin endpoints must target the engine port directly.

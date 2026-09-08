@@ -134,6 +134,16 @@ class SFTDataConfig(BaseDataConfig):
         return self
 
 
+class PreparedDataConfig(BaseDataConfig):
+    """Finite JSONL rows containing already-shifted targets and packing boundaries."""
+
+    type: Literal["prepared"] = "prepared"
+    path: Path
+    epochs: int = Field(1, ge=1)
+    shuffle: bool = True
+    seed: int = 0
+
+
 class SFTValConfig(BaseConfig):
     interval: int = Field(50, ge=1)
     """Run validation every N training steps."""
@@ -141,10 +151,10 @@ class SFTValConfig(BaseConfig):
     eval_on_start: bool = False
     """Run validation before the first training step."""
 
-    data: SFTDataConfig
+    data: SFTDataConfig | PreparedDataConfig
 
 
-DataConfig: TypeAlias = Annotated[FakeDataConfig | SFTDataConfig, Field(discriminator="type")]
+DataConfig: TypeAlias = Annotated[FakeDataConfig | SFTDataConfig | PreparedDataConfig, Field(discriminator="type")]
 
 
 class BaseDeploymentConfig(BaseConfig):
@@ -492,7 +502,7 @@ class SFTConfig(BaseConfig):
     @model_validator(mode="after")
     def validate_typed_renderer(self):
         """Require a typed renderer whenever SFT renders real samples."""
-        if self.data.type == "fake" and self.val is None:
+        if self.data.type != "sft" and (self.val is None or self.val.data.type != "sft"):
             return self
 
         model_id = self.tokenizer.name or self.model.name
