@@ -330,7 +330,8 @@ def test_qorl_anchored_grpo_penalizes_timeout_at_the_same_measured_score():
     assert timeout.quality == pytest.approx(candidate.quality - 0.10)
 
 
-def test_qorl_anchored_grpo_reads_qorl_final_results():
+@pytest.mark.parametrize("invalid_kind", ["no_valid_candidate", "selection_failed"])
+def test_qorl_anchored_grpo_reads_qorl_final_results(invalid_kind):
     group = _qorl_group(
         [
             {"kind": "kept_default", "speedup": 1.0},
@@ -342,13 +343,14 @@ def test_qorl_anchored_grpo_reads_qorl_final_results():
                 "timing_reuse_key": "candidate-plan",
                 "speedup": 1.4,
             },
-            {"kind": "no_valid_candidate", "speedup": None},
+            {"kind": invalid_kind, "speedup": None},
         ]
     )
 
     advantages = _score_qorl_group(group)
 
     assert advantages == pytest.approx([-0.143, -0.163, 0.286, -0.1], abs=1e-3)
+    assert all(episode.traces[0].info["qorl_advantage"]["discarded"] is False for episode in group)
     logged = group[2].traces[0].info["qorl_advantage"]
     assert logged["rule"] == "qorl_anchored_grpo"
     assert logged["discarded"] is False
@@ -358,6 +360,11 @@ def test_qorl_anchored_grpo_reads_qorl_final_results():
         {"quality": 0.286, "reference": 0.0, "protocol_cost": 0.0, "advantage": 0.286},
         abs=1e-3,
     )
+
+
+def test_selection_failure_cannot_claim_measured_speedup():
+    with pytest.raises(ValueError, match="selection_failed cannot have a measured speedup"):
+        decision_from_final({"kind": "selection_failed", "speedup": 1.0})
 
 
 @pytest.mark.parametrize("case", ["zero", "discarded", "rejected", "shipped"])

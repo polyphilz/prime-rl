@@ -101,7 +101,9 @@ class FinalEvidence(BaseModel):
     """Only the finalized measurement fields consumed by credit assignment."""
 
     model_config = ConfigDict(extra="ignore", strict=True, allow_inf_nan=False)
-    kind: Literal["kept_default", "default_duplicate", "measured", "timed_out", "no_valid_candidate"]
+    kind: Literal[
+        "kept_default", "default_duplicate", "measured", "timed_out", "no_valid_candidate", "selection_failed"
+    ]
     speedup: float | None
     selected_candidate_id: str | None = None
     selected_plan_sha256: str | None = None
@@ -138,9 +140,9 @@ def decision_from_final(final: dict[str, Any]) -> QorlDecision:
         if evidence.speedup != 1.0:
             raise ValueError("default reuse requires speedup 1.0")
         return QorlDecision("keep_default" if evidence.kind == "kept_default" else "default_duplicate")
-    if evidence.kind == "no_valid_candidate":
+    if evidence.kind in {"no_valid_candidate", "selection_failed"}:
         if evidence.speedup is not None:
-            raise ValueError("no_valid_candidate cannot have a measured speedup")
+            raise ValueError(f"{evidence.kind} cannot have a measured speedup")
         return QorlDecision("invalid")
     if not evidence.selected_candidate_id:
         raise ValueError("selected outcome requires a candidate ID")
