@@ -5,13 +5,11 @@ import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Self
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from torch.utils.data import Dataset
-from torchdata.stateful_dataloader import StatefulDataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from prime_rl.configs.sft import PreparedDataConfig
 from prime_rl.trainer.sft.data import Batch
@@ -144,18 +142,6 @@ class PreparedDataset(Dataset[PreparedStep]):
         )
 
 
-def prepared_dataloader(dataset: PreparedDataset) -> StatefulDataLoader:
-    """Checkpoint the ordered step cursor, including worker prefetch state."""
-    return StatefulDataLoader(dataset, batch_size=None, num_workers=dataset.config.num_workers)
-
-
-def save_rng(path: Path) -> None:
-    """Save per-rank model randomness alongside an SFT checkpoint."""
-    torch.save({"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all()}, path)
-
-
-def load_rng(path: Path) -> None:
-    """Restore randomness after constructing the model and dataloader iterator."""
-    state = torch.load(path, weights_only=True)
-    torch.set_rng_state(state["cpu"])
-    torch.cuda.set_rng_state_all(state["cuda"])
+def prepared_dataloader(dataset: PreparedDataset) -> DataLoader:
+    """Read each scheduled optimizer batch once, in order."""
+    return DataLoader(dataset, batch_size=None, num_workers=dataset.config.num_workers)

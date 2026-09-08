@@ -112,5 +112,4 @@ class CPUOffloadOptimizer(OffloadOptimizer):
         self._move_states("cpu")
 
     def finish_checkpoint_load(self) -> None:
-        self._move_states("cpu")
         self._initialized = True

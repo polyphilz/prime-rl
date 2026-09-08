@@ -49,9 +49,7 @@ from prime_rl.trainer.sft.data import (
 from prime_rl.trainer.sft.prepared import (
     PreparedDataset,
     gradient_scale,
-    load_rng,
     prepared_dataloader,
-    save_rng,
     validation_mode,
 )
 from prime_rl.trainer.utils import (
@@ -87,16 +85,8 @@ def train(config: SFTConfig):
             raise ValueError("prepared max_steps must equal epochs * ceil(rows / batch_size)")
         config.max_steps = len(prepared)
         torch.manual_seed(config.data.seed)
-        if config.resume is not None and config.ckpt is not None:
-            if any(
-                (
-                    config.ckpt.skip_optimizer,
-                    config.ckpt.skip_scheduler,
-                    config.ckpt.skip_progress,
-                    config.ckpt.skip_dataloader,
-                )
-            ):
-                raise ValueError("prepared resume requires optimizer, scheduler, progress and dataloader state")
+        if config.resume is not None:
+            raise ValueError("prepared SFT training cannot resume; start a new run")
     logger = setup_logger(
         config.log.level,
         json_logging=config.log.json_logging,
@@ -290,11 +280,6 @@ def train(config: SFTConfig):
     # an already-running worker (the run silently restarts the data from the beginning
     # and re-saves the stale position).
     dataiter = iter(dataloader)
-    if prepared is not None and checkpoint_step is not None:
-        checkpoint_path = (
-            config.resume.dir / "trainer" if config.resume.dir else ckpt_manager.get_ckpt_path(checkpoint_step)
-        )
-        load_rng(checkpoint_path / f"rng_rank_{world.rank}.pt")
 
     cp_enabled = parallel_dims.cp_enabled
     cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
@@ -640,9 +625,14 @@ def train(config: SFTConfig):
         if ckpt_manager is not None and is_ckpt_step and not is_last_step:
             logger.info(f"Saving checkpoint at step {progress.step}")
             save_ckpt_start_time = time.perf_counter()
-            ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress, dataloader=dataloader)
-            if prepared is not None:
-                save_rng(ckpt_manager.get_ckpt_path(progress.step) / f"rng_rank_{world.rank}.pt")
+            ckpt_manager.save(
+                progress.step,
+                model,
+                [optimizer],
+                scheduler,
+                progress,
+                dataloader=dataloader if prepared is None else None,
+            )
             save_ckpt_time += time.perf_counter() - save_ckpt_start_time
 
             ckpt_manager.maybe_clean()
@@ -775,9 +765,14 @@ def train(config: SFTConfig):
     # Write final checkpoint
     if config.ckpt is not None:
         logger.info(f"Saving final checkpoint at step {progress.step}")
-        ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress, dataloader=dataloader)
-        if prepared is not None:
-            save_rng(ckpt_manager.get_ckpt_path(progress.step) / f"rng_rank_{world.rank}.pt")
+        ckpt_manager.save(
+            progress.step,
+            model,
+            [optimizer],
+            scheduler,
+            progress,
+            dataloader=dataloader if prepared is None else None,
+        )
         ckpt_manager.maybe_clean()
 
     # Broadcast the final weights so the evals process can run its forced final epoch

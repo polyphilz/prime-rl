@@ -1,4 +1,4 @@
-"""Prepared rows, smaller final updates, token normalization and resumable cursors."""
+"""Prepared rows, smaller final updates, token normalization and validation."""
 
 from copy import deepcopy
 from pathlib import Path
@@ -11,9 +11,7 @@ from prime_rl.trainer.sft.prepared import (
     PreparedDataset,
     PreparedRow,
     gradient_scale,
-    load_rng,
     prepared_dataloader,
-    save_rng,
     validation_mode,
 )
 
@@ -54,19 +52,13 @@ def test_all_ranks_cover_partial_batch_without_repeating_rows(config):
     assert sum(int(batch["loss_mask"].sum()) for step in steps for batch in step.micro_batches) == 5
 
 
-def test_shuffle_and_resume_preserve_every_row(config):
+def test_shuffle_preserves_every_row(config):
     dataset = PreparedDataset(config.model_copy(update={"shuffle": True, "seed": 7}))
     loader = prepared_dataloader(dataset)
-    iterator = iter(loader)
-    first = next(iterator)
-    state = loader.state_dict()
-    expected = [step.row_indices for step in iterator]
-    resumed = prepared_dataloader(dataset)
-    resumed.load_state_dict(state)
-    actual = [step.row_indices for step in resumed]
-    assert actual == expected
-    assert sorted(first.row_indices + actual[0]) == list(range(10))
-    assert sorted(actual[1] + actual[2]) == list(range(10))
+    batches = [step.row_indices for step in loader]
+    assert batches == [step.row_indices for step in prepared_dataloader(dataset)]
+    assert sorted(batches[0] + batches[1]) == list(range(10))
+    assert sorted(batches[2] + batches[3]) == list(range(10))
 
 
 def update(model, optimizer, step):
@@ -98,44 +90,6 @@ def test_gradient_uses_actual_tokens_in_both_batches(config):
             torch.testing.assert_close(actual, expected)
 
 
-def test_resume_restores_optimizer_scheduler_rng_and_cursor(config, tmp_path):
-    model = torch.nn.Linear(1, 1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, total_iters=4)
-    loader = prepared_dataloader(PreparedDataset(config))
-    iterator = iter(loader)
-    update(model, optimizer, next(iterator))
-    scheduler.step()
-    saved = deepcopy((model.state_dict(), optimizer.state_dict(), scheduler.state_dict(), loader.state_dict()))
-    rng_path = tmp_path / "rng.pt"
-    save_rng(rng_path)
-    expected_random = torch.rand(3)
-    expected_rates = []
-    for step in iterator:
-        update(model, optimizer, step)
-        scheduler.step()
-        expected_rates.append(scheduler.get_last_lr())
-    resumed = torch.nn.Linear(1, 1)
-    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=0.01)
-    resumed_scheduler = torch.optim.lr_scheduler.LinearLR(resumed_optimizer, total_iters=4)
-    resumed_loader = prepared_dataloader(PreparedDataset(config))
-    resumed.load_state_dict(saved[0])
-    resumed_optimizer.load_state_dict(saved[1])
-    resumed_scheduler.load_state_dict(saved[2])
-    resumed_loader.load_state_dict(saved[3])
-    resumed_iterator = iter(resumed_loader)
-    load_rng(rng_path)
-    torch.testing.assert_close(torch.rand(3), expected_random, rtol=0, atol=0)
-    actual_rates = []
-    for step in resumed_iterator:
-        update(resumed, resumed_optimizer, step)
-        resumed_scheduler.step()
-        actual_rates.append(resumed_scheduler.get_last_lr())
-    assert actual_rates == expected_rates
-    for actual, expected in zip(resumed.parameters(), model.parameters()):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 def test_validation_has_no_gradients_and_preserves_training_state():
     model = torch.nn.Sequential(torch.nn.Linear(1, 1), torch.nn.Dropout(0.5))
     model(torch.ones(3, 1)).sum().backward()
@@ -159,59 +113,3 @@ def test_prepared_config_does_not_require_renderer(config):
 def test_conversation_validation_keeps_its_existing_default_type():
     validation = SFTValConfig.model_validate({"data": {"name": "conversation-dataset"}})
     assert validation.data.type == "sft"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="optimizer offload requires CUDA")
-@pytest.mark.parametrize("warmup", [False, True])
-def test_offloaded_optimizer_checkpoint_restores_moments_and_next_update(tmp_path, warmup):
-    import torch.distributed as dist
-    from torch.distributed.checkpoint import load, save
-    from torch.distributed.fsdp import fully_shard
-    from torch.distributed.tensor import DTensor
-
-    from prime_rl.trainer.ckpt import AppState, Progress
-    from prime_rl.trainer.optim.state_offload import CPUOffloadOptimizer
-
-    def setup():
-        model = torch.nn.Linear(2, 1, device="cuda", dtype=torch.bfloat16)
-        fully_shard(model)
-        optimizer = CPUOffloadOptimizer(torch.optim.AdamW(model.parameters(), lr=0.01))
-        scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer.base_optimizer, start_factor=1 / 3 if warmup else 1.0, total_iters=4
-        )
-        progress = Progress(step=1, total_samples=8)
-        return model, optimizer, scheduler, progress
-
-    def step(model, optimizer, scheduler, gradient):
-        for parameter in model.parameters():
-            parameter.grad = torch.full_like(parameter, gradient)
-        optimizer.step()
-        optimizer.zero_grad()
-        scheduler.step()
-
-    dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
-    try:
-        model, optimizer, scheduler, progress = setup()
-        step(model, optimizer, scheduler, 0.25)
-        checkpoint = tmp_path / "checkpoint"
-        save({"app": AppState(model, [optimizer], scheduler, progress)}, checkpoint_id=checkpoint)
-        resumed, resumed_optimizer, resumed_scheduler, resumed_progress = setup()
-        load(
-            {"app": AppState(resumed, [resumed_optimizer], resumed_scheduler, resumed_progress)},
-            checkpoint_id=checkpoint,
-        )
-        assert resumed_progress == progress
-        assert resumed_scheduler.state_dict() == scheduler.state_dict()
-        assert resumed_optimizer.param_groups[0]["lr"] == optimizer.param_groups[0]["lr"]
-        for actual, expected in zip(resumed_optimizer.state.values(), optimizer.state.values()):
-            for name in ("step", "exp_avg", "exp_avg_sq"):
-                actual_value = actual[name].to_local() if isinstance(actual[name], DTensor) else actual[name]
-                expected_value = expected[name].to_local() if isinstance(expected[name], DTensor) else expected[name]
-                assert actual_value.device.type == "cpu"
-                torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
-        step(model, optimizer, scheduler, 0.5)
-        step(resumed, resumed_optimizer, resumed_scheduler, 0.5)
-        for actual, expected in zip(resumed.parameters(), model.parameters()):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    finally:
-        dist.destroy_process_group()

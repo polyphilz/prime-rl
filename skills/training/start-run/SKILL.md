@@ -79,10 +79,8 @@ The optimizer consumes the smaller last batch in each epoch without repeating
 rows. Set `max_steps` to `epochs * ceil(rows / batch_size)` or omit it.
 With validation configured, prepared training validates after every completed
 epoch; `val.eval_on_start` evaluates incoming weights at step zero. Validation
-steps identify completed optimizer updates. Resume requires all optimizer,
-scheduler, progress, dataloader and per-rank RNG checkpoint state.
-Check resumed optimizer moments as well as weights and row position: state-only
-CPU offload must apply the loaded DCP optimizer state before moving it back to CPU.
+steps identify completed optimizer updates. Prepared SFT does not support resume;
+restart into a new run directory. Checkpoints remain available for model export.
 
 ## `inference` — vLLM server
 
