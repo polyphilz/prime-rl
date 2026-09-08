@@ -14,7 +14,6 @@ from wandb.sdk.mailbox.mailbox_handle import ServerResponseError
 
 from prime_rl.configs.monitors import WandbMonitorConfig
 from prime_rl.monitors.base import Kind, Monitor, Subset
-from prime_rl.monitors.wandb.overview import ensure_overview_view
 from prime_rl.utils.config import BaseConfig
 from prime_rl.utils.logger import format_time
 
@@ -125,6 +124,8 @@ class WandbMonitor(Monitor):
         # take down training.
         if is_online and (primary if shared_mode else True):
             try:
+                from prime_rl.monitors.wandb.overview import ensure_overview_view
+
                 url = ensure_overview_view(
                     self.wandb.entity,
                     self.wandb.project,
