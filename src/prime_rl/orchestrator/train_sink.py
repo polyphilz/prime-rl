@@ -14,9 +14,11 @@ from collections.abc import Callable, Iterable
 
 import verifiers.v1 as vf
 
+from prime_rl import monitors
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.algo.base import iter_trainable_traces
 from prime_rl.orchestrator.algo.routing import stamp_loss_routing
+from prime_rl.orchestrator.annotations import stamp_group
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.metrics import TrainEpisodes
 from prime_rl.orchestrator.trajectories import trace_to_samples
@@ -266,6 +268,7 @@ class TrainSink:
         survivors = [trace for _, trace in iter_trainable_traces(group)]
         if survivors:
             await env.algorithm.finalize_group(group)
+            await monitors.log_annotations(stamp_group(group))
         admitted = self._admit(group) if group else False
         if not survivors or not admitted:
             self.pending_episodes.extend(group, admitted=admitted)

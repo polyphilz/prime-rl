@@ -1,14 +1,22 @@
 import asyncio
+import json
+from unittest.mock import Mock
 
 import pytest
 import verifiers.v1 as vf
 
+from prime_rl import monitors
 from prime_rl.configs.algorithm import (
     GRPOAlgoConfig,
     LinearLengthPenaltyConfig,
     MaxRLAlgoConfig,
     QorlAnchoredGRPOAlgoConfig,
 )
+from prime_rl.configs.monitors import FileMonitorConfig
+from prime_rl.configs.orchestrator import ModelConfig, OrchestratorConfig
+from prime_rl.monitors.file import FileMonitor
+from prime_rl.monitors.file.traces import get_annotations_dir, get_trace_stream
+from prime_rl.monitors.file.traces.update import fold_trace_updates
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.max_rl import MaxRLAlgorithm
 from prime_rl.orchestrator.algo.qorl_anchored_grpo import (
@@ -19,7 +27,10 @@ from prime_rl.orchestrator.algo.qorl_anchored_grpo import (
     share_reusable_speedups,
 )
 from prime_rl.orchestrator.algo.routing import assign_advantages
+from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
+from prime_rl.orchestrator.train_sink import TrainSink
 from prime_rl.orchestrator.trajectories import trace_to_samples
+from prime_rl.orchestrator.types import Progress
 
 
 def _build_episode(
@@ -347,6 +358,58 @@ def test_qorl_anchored_grpo_reads_qorl_final_results():
         {"quality": 0.286, "reference": 0.0, "protocol_cost": 0.0, "advantage": 0.286},
         abs=1e-3,
     )
+
+
+@pytest.mark.parametrize("case", ["zero", "discarded", "rejected", "shipped"])
+def test_qorl_group_credit_is_saved_before_shipping(case, tmp_path, monkeypatch):
+    group = _qorl_group([{"kind": "kept_default", "speedup": 1.0}] * 4)
+    if case in ("rejected", "shipped"):
+        group[0].traces[0].info["qorl"]["final"] = {"kind": "no_valid_candidate", "speedup": None}
+    if case == "discarded":
+        group[-1].ok = False
+        group[-1].traces[0].errors = [vf.Error(type="DatabaseError", message="unavailable")]
+    algorithm = QorlAnchoredGRPO(QorlAnchoredGRPOAlgoConfig(expected_group_size=4), clients=None)
+    env = Mock(algorithm=algorithm, sampling_args={"temperature": 1.0}, requires_sampling_masks=False)
+    sink = TrainSink(
+        OrchestratorConfig(model=ModelConfig(name="Qwen/Qwen3-0.6B"), constant_trainer_batch_size=True),
+        tokenizer=None,
+        train_envs=Mock(get=Mock(return_value=env)),
+        progress=Progress(),
+        batch_size=4,
+        token_batch_size=None,
+        on_result=lambda _: case != "rejected",
+    )
+    monitor = FileMonitor(FileMonitorConfig(compress=False, float_decimals=None))
+    monkeypatch.setattr(monitors, "MONITORS", [monitor])
+
+    async def run():
+        await monitor.init(tmp_path, producer="orchestrator")
+        try:
+            stamp_arrival(group, "train", 1)
+            await monitor.log(group, step=1, kind="train", subset="all")
+            sink.pending_groups["group"] = group
+            await sink.process_group("group")
+            if case == "shipped":
+                assert sink.pending_batch
+                await monitor.log_annotations(stamp_batch(group, 1))
+            else:
+                assert not sink.pending_batch
+        finally:
+            await monitor.finalize()
+
+    asyncio.run(run())
+    arrivals = [json.loads(line) for line in (get_trace_stream(tmp_path) / "00000.jsonl").read_text().splitlines()]
+    updates = [
+        json.loads(line)
+        for line in (get_annotations_dir(tmp_path) / "orchestrator/00000.jsonl").read_text().splitlines()
+    ]
+    for episode, arrival in zip(group, arrivals, strict=True):
+        trace = arrival["traces"][0]
+        assert "qorl_advantage" not in trace["info"]
+        fold_trace_updates(trace, [update for update in updates if update["trace_id"] == trace["id"]])
+        assert trace["info"]["qorl_advantage"] == episode.traces[0].info["qorl_advantage"]
+        assert trace["info"]["qorl_advantage"]["discarded"] == (case == "discarded")
+        assert ("ship" in trace["info"]) == (case == "shipped")
 
 
 def test_qorl_anchored_grpo_shares_speedup_by_non_default_fingerprint():

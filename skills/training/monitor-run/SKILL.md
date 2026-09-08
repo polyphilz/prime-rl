@@ -170,13 +170,19 @@ curl -s http://localhost:8100/metrics | grep -E "num_requests|gpu_cache_usage"  
 {run_dir}/monitors/file/traces/stream/00000.jsonl.zst              # every episode, appended as it arrives: sealed chunks ...
 {run_dir}/monitors/file/traces/stream/00001.jsonl                  # ... and the live one, plain text
 {run_dir}/monitors/file/traces/stream.index.jsonl                  # one compact row per episode, with its chunk and byte offset
-{run_dir}/monitors/file/traces/annotations/{producer}/00000.jsonl  # trace updates: orch ship-time facts, trainer per-token streams
+{run_dir}/monitors/file/traces/annotations/{producer}/00000.jsonl  # trace updates: group credit, ship-time facts, trainer per-token streams
 {run_dir}/monitors/file/traces/annotations/{producer}.index.jsonl  # each update's scalars and where its record sits
 ```
 
 Everything the file monitor dumps lives under `monitors/file/`; nothing is written
 there when the monitor is off. The traces and everything written about them sit under
-`traces/`. Each stream is a directory of numbered chunks — the writer rolls to a new
+`traces/`. Algorithm credit is appended immediately after group scoring, before
+admission and zero-advantage pruning. For QORL, `info.qorl_advantage` therefore
+retains quality, reference and discard reason even when the scored group never
+ships. Read it separately from generic scalar reward and later `info.ship` facts.
+Arrival records also preserve failed episodes with no traces; those have no
+trace-level credit annotation. Each stream is a directory of numbered chunks —
+the writer rolls to a new
 chunk at `monitors.file.chunk_bytes` (5 GiB) and, with `monitors.file.compress` (on),
 seals the full one with zstd in the background; a finished run seals its live chunk
 too. Sealed chunks use seekable frames, so a seek still costs one frame, and

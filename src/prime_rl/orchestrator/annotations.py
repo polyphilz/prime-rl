@@ -30,6 +30,17 @@ def stamp_arrival(episodes: list[vf.Episode], kind: Kind, step: int) -> None:
             trace.info["arrival"] = {"step": step, "time": now}
 
 
+def stamp_group(episodes: list[vf.Episode]) -> list[dict[str, Any]]:
+    """Persist algorithm credit before admission or zero-advantage pruning."""
+    updates = []
+    for episode in episodes:
+        for trace in episode.traces:
+            info = {key: trace.info[key] for key in ("advantage", "qorl_advantage") if key in trace.info}
+            if info:
+                updates.append(make_update(trace.id, info=info))
+    return updates
+
+
 def stamp_batch(episodes: list[vf.Episode], step: int) -> list[dict[str, Any]]:
     """The updates a batched cohort adds over its arrival records: membership, the step
     it ties to, the scalar advantage, and the per-token advantage streams."""
