@@ -7,11 +7,14 @@ import pytest
 import torch
 
 from prime_rl.configs.sft import PreparedDataConfig, SFTConfig, SFTValConfig
+from prime_rl.configs.shared import ResumeConfig, RunConfig
+from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.trainer.sft.prepared import (
     PreparedDataset,
     PreparedRow,
     gradient_scale,
     prepared_dataloader,
+    validate_continuation,
     validation_mode,
 )
 
@@ -59,6 +62,114 @@ def test_shuffle_preserves_every_row(config):
     assert batches == [step.row_indices for step in prepared_dataloader(dataset)]
     assert sorted(batches[0] + batches[1]) == list(range(10))
     assert sorted(batches[2] + batches[3]) == list(range(10))
+
+
+@pytest.mark.parametrize("workers", [0, 1])
+def test_continuation_starts_at_next_absolute_epoch(config, workers):
+    dataset = PreparedDataset(config.model_copy(update={"shuffle": True, "seed": 42, "num_workers": workers}))
+    complete = list(prepared_dataloader(dataset))
+    resumed = list(prepared_dataloader(dataset, completed_steps=2))
+    assert [step.row_indices for step in resumed] == [step.row_indices for step in complete[2:]]
+    assert [step.epoch for step in resumed] == [1, 1]
+    assert [len(step.row_indices) for step in resumed] == [8, 2]
+    for actual, expected in zip(resumed, complete[2:]):
+        for actual_batch, expected_batch in zip(actual.micro_batches, expected.micro_batches):
+            for key in ("input_ids", "target_ids", "loss_mask", "position_ids", "seq_lens"):
+                torch.testing.assert_close(actual_batch[key], expected_batch[key])
+
+
+@pytest.mark.parametrize("completed", [-1, 1, 3, 4])
+def test_continuation_rejects_non_epoch_or_exhausted_position(config, completed):
+    with pytest.raises(ValueError, match="completed epoch"):
+        prepared_dataloader(PreparedDataset(config), completed_steps=completed)
+
+
+def test_external_native_sibling_runs_and_symlink_safety(config, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    native = SFTConfig(
+        data=config,
+        output_dir=tmp_path,
+        run=RunConfig(dir="destination"),
+        resume=ResumeConfig(dir=source / "checkpoints/step_2"),
+    )
+    validate_continuation(native)
+    alias = tmp_path / "alias"
+    alias.symlink_to(source, target_is_directory=True)
+    native.run.dir = "alias/nested"
+    with pytest.raises(ValueError, match="overlap"):
+        validate_continuation(native)
+    native.run.dir = "destination"
+    native.ckpt = CheckpointConfig(output_dir=alias)
+    with pytest.raises(ValueError, match="overlap"):
+        validate_continuation(native)
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_checkpoint_continuation_matches_uninterrupted_adamw(config, tmp_path, offload):
+    pytest.importorskip("dion", reason="native optimizer dependencies require the GPU installation")
+    if offload and not torch.cuda.is_available():
+        pytest.skip("state-only CPU offload requires CUDA")
+    from torch.distributed.checkpoint import load, save
+
+    from prime_rl.trainer.ckpt import AppState, Progress
+    from prime_rl.trainer.optim.state_offload import CPUOffloadOptimizer
+    from prime_rl.trainer.scheduler import setup_constant_scheduler
+
+    device = "cuda" if offload else "cpu"
+    torch.manual_seed(42)
+    model = torch.nn.Linear(1, 1).to(device)
+    reference = deepcopy(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, betas=(0.8, 0.95))
+    reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.003, betas=(0.8, 0.95))
+    if offload:
+        optimizer = CPUOffloadOptimizer(optimizer)
+        reference_optimizer = CPUOffloadOptimizer(reference_optimizer)
+    scheduler = setup_constant_scheduler(optimizer.base_optimizer if offload else optimizer)
+    reference_scheduler = setup_constant_scheduler(
+        reference_optimizer.base_optimizer if offload else reference_optimizer
+    )
+    dataset = PreparedDataset(config.model_copy(update={"shuffle": True, "seed": 42}))
+
+    def run_step(target, optim, scheduled):
+        for batch in scheduled.micro_batches:
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(device)
+        update(target, optim, scheduled)
+
+    for index in range(4):
+        run_step(reference, reference_optimizer, dataset[index])
+        reference_scheduler.step()
+    for index in range(2):
+        run_step(model, optimizer, dataset[index])
+        scheduler.step()
+    expected_states = deepcopy(optimizer.state_dict())
+    expected_scheduler = deepcopy(scheduler.state_dict())
+    progress = Progress(step=2, total_samples=10, total_tokens=40)
+    save({"app": AppState(model, [optimizer], scheduler, progress)}, checkpoint_id=tmp_path / "checkpoint")
+    restored = torch.nn.Linear(1, 1).to(device)
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.9)
+    if offload:
+        restored_optimizer = CPUOffloadOptimizer(restored_optimizer)
+    restored_scheduler = setup_constant_scheduler(restored_optimizer.base_optimizer if offload else restored_optimizer)
+    restored_progress = Progress()
+    load(
+        {"app": AppState(restored, [restored_optimizer], restored_scheduler, restored_progress)},
+        checkpoint_id=tmp_path / "checkpoint",
+    )
+    assert restored_progress == progress
+    assert restored_scheduler.state_dict() == expected_scheduler
+    actual_states = restored_optimizer.state_dict()
+    assert actual_states["param_groups"] == expected_states["param_groups"]
+    for key, state in expected_states["state"].items():
+        for name, value in state.items():
+            torch.testing.assert_close(actual_states["state"][key][name], value)
+    for scheduled in prepared_dataloader(dataset, completed_steps=restored_progress.step):
+        run_step(restored, restored_optimizer, scheduled)
+        restored_scheduler.step()
+    for actual, expected in zip(restored.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
 
 
 def update(model, optimizer, step):

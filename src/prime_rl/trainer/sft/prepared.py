@@ -11,7 +11,29 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch.utils.data import DataLoader, Dataset
 
-from prime_rl.configs.sft import PreparedDataConfig
+from prime_rl.configs.sft import PreparedDataConfig, SFTConfig
+
+
+def validate_continuation(config: SFTConfig) -> None:
+    """Keep external prepared continuation separate and restore all training state."""
+    if config.resume is None:
+        return
+    if config.resume.dir is None:
+        raise ValueError("prepared continuation requires an external checkpoint step directory")
+    source = config.resume.dir.resolve().parent.parent
+    destination = config.run_dir.resolve()
+    if source.is_relative_to(destination) or destination.is_relative_to(source):
+        raise ValueError("prepared continuation source and destination must not overlap")
+    if config.ckpt and config.ckpt.output_dir is not None:
+        checkpoint_output = config.ckpt.output_dir.resolve()
+        if source.is_relative_to(checkpoint_output) or checkpoint_output.is_relative_to(source):
+            raise ValueError("prepared continuation checkpoint output must not overlap its source")
+    if config.scheduler.type != "constant" or (config.model.lora and config.model.lora.dropout != 0):
+        raise ValueError("prepared continuation requires constant scheduling and zero LoRA dropout")
+    if config.ckpt and any((config.ckpt.skip_optimizer, config.ckpt.skip_scheduler, config.ckpt.skip_progress)):
+        raise ValueError("prepared continuation must restore optimizer, scheduler and progress")
+
+
 from prime_rl.trainer.sft.data import Batch
 
 
@@ -142,6 +164,10 @@ class PreparedDataset(Dataset[PreparedStep]):
         )
 
 
-def prepared_dataloader(dataset: PreparedDataset) -> DataLoader:
+def prepared_dataloader(dataset: PreparedDataset, completed_steps: int = 0) -> DataLoader:
     """Read each scheduled optimizer batch once, in order."""
-    return DataLoader(dataset, batch_size=None, num_workers=dataset.config.num_workers)
+    if not 0 <= completed_steps < len(dataset) or completed_steps % dataset.steps_per_epoch:
+        raise ValueError("prepared continuation requires a completed epoch with additional epochs remaining")
+    return DataLoader(
+        dataset, batch_size=None, sampler=range(completed_steps, len(dataset)), num_workers=dataset.config.num_workers
+    )

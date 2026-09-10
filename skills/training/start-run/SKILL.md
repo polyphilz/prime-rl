@@ -83,9 +83,14 @@ Prepared text rows use `data.type = "prepared"`, `data.path` (JSONL), and
 The optimizer consumes the smaller last batch in each epoch without repeating
 rows. Set `max_steps` to `epochs * ceil(rows / batch_size)` or omit it.
 With validation configured, prepared training validates after every completed
-epoch; `val.eval_on_start` evaluates incoming weights at step zero. Validation
-steps identify completed optimizer updates. Prepared SFT does not support resume;
-restart into a new run directory. Checkpoints remain available for model export.
+epoch; `val.eval_on_start` evaluates incoming weights at the starting completed
+step (zero for a fresh run). Prepared continuation uses `resume.dir` pointing to
+an external completed epoch's `step_N` directory and a separate output run.
+`data.epochs` is the total desired epoch count. It requires constant scheduling,
+zero LoRA dropout and restoration of optimizer, scheduler and progress. Row order
+starts at the next absolute epoch seed; no dataloader sidecar is required.
+Historical RNG state is not restored, so this is not a bitwise replay guarantee.
+Callers must verify the original prepared rows and training settings match.
 
 ## `inference` — vLLM server
 

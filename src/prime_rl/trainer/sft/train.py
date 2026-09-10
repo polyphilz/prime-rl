@@ -51,6 +51,7 @@ from prime_rl.trainer.sft.prepared import (
     PreparedDataset,
     gradient_scale,
     prepared_dataloader,
+    validate_continuation,
     validation_mode,
 )
 from prime_rl.trainer.utils import (
@@ -86,8 +87,7 @@ def train(config: SFTConfig):
             raise ValueError("prepared max_steps must equal epochs * ceil(rows / batch_size)")
         config.max_steps = len(prepared)
         torch.manual_seed(config.data.seed)
-        if config.resume is not None:
-            raise ValueError("prepared SFT training cannot resume; start a new run")
+        validate_continuation(config)
     logger = setup_logger(
         config.log.level,
         json_logging=config.log.json_logging,
@@ -254,9 +254,19 @@ def train(config: SFTConfig):
             [optimizer],
             scheduler if not skip.skip_scheduler else None,
             progress if not skip.skip_progress else None,
-            dataloader=dataloader if not skip.skip_dataloader else None,
+            dataloader=dataloader if prepared is None and not skip.skip_dataloader else None,
             path=resume_dir / "trainer" if resume_dir is not None else None,
         )
+        if prepared is not None:
+            if progress.step != checkpoint_step:
+                raise ValueError("checkpoint progress differs from the requested completed step")
+            dataloader = prepared_dataloader(prepared, completed_steps=progress.step)
+            expected_samples = (progress.step // prepared.steps_per_epoch) * len(prepared.offsets)
+            if (
+                progress.total_samples != expected_samples
+                or progress.total_tokens != expected_samples * config.data.seq_len
+            ):
+                raise ValueError("checkpoint sample/token progress differs from the prepared epoch schedule")
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         if not skip.skip_progress:
             progress.step += 1
@@ -265,7 +275,8 @@ def train(config: SFTConfig):
             scheduler = setup_scheduler(optimizer, config.scheduler, scheduler_steps, config.optim.lr)
         logger.info(
             f"Resuming from step {checkpoint_step} (total_tokens={progress.total_tokens}, "
-            f"total_samples={progress.total_samples}, dataset_state={get_dataset_state(dataloader)})"
+            f"total_samples={progress.total_samples}, "
+            f"dataset_state={f'completed epochs={checkpoint_step // prepared.steps_per_epoch}' if prepared is not None else get_dataset_state(dataloader)})"
         )
     else:
         logger.info("Starting from scratch")
@@ -461,8 +472,8 @@ def train(config: SFTConfig):
 
     logger.info(f"Starting training loop (max_steps={config.max_steps or 'infinite'})")
     max_memory = torch.cuda.mem_get_info()[1] / 1024**3  # GiB
-    if config.val is not None and config.val.eval_on_start and checkpoint_step is None:
-        run_validation(0)
+    if config.val is not None and config.val.eval_on_start and (checkpoint_step is None or prepared is not None):
+        run_validation(checkpoint_step or 0)
     if config.trace_path:
         logger.info(f"Tracing to {config.trace_path}")
         prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
