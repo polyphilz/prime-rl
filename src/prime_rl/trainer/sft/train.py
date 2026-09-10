@@ -47,6 +47,7 @@ from prime_rl.trainer.sft.data import (
     setup_dataloader,
     setup_dataset,
 )
+from prime_rl.trainer.sft.adapter import load_initial_adapter
 from prime_rl.trainer.sft.prepared import (
     PreparedDataset,
     gradient_scale,
@@ -186,6 +187,9 @@ def train(config: SFTConfig):
 
     if config.model.lora is not None:
         get_lora_state().reset_adapter_parameters()
+        if config.initial_adapter is not None:
+            load_initial_adapter(model, config.initial_adapter, config.model.lora)
+            logger.info(f"Initialized LoRA weights from {config.initial_adapter}; optimizer and progress start fresh")
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
@@ -279,7 +283,11 @@ def train(config: SFTConfig):
             f"dataset_state={f'completed epochs={checkpoint_step // prepared.steps_per_epoch}' if prepared is not None else get_dataset_state(dataloader)})"
         )
     else:
-        logger.info("Starting from scratch")
+        logger.info(
+            "Starting with initialized adapter weights"
+            if config.initial_adapter is not None
+            else "Starting from scratch"
+        )
 
     # Create the iterator only after a potential resume: iter() forks workers with a
     # copy of the dataset's *current* state, so a later load_state_dict never reaches

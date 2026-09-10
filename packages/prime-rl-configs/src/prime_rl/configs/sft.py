@@ -234,6 +234,10 @@ class SFTConfig(BaseConfig):
     resume: ResumeConfig | None = None
     """Resume the run from a checkpoint (point at it with the previous run's ``run.name``). Without ``[ckpt]`` the run loads the checkpoint but saves no new ones. If None, does not resume."""
 
+    # Keep existing recorded configuration hashes unchanged when unused.
+    initial_adapter: Path | None = Field(default=None, exclude_if=lambda value: value is None)
+    """Initialize LoRA weights from an exported adapter, with fresh optimizer and data progress."""
+
     log: TrainerLogConfig = TrainerLogConfig()
 
     monitors: MonitorsConfig = MonitorsConfig()
@@ -331,6 +335,22 @@ class SFTConfig(BaseConfig):
         return data
 
     ### Validate configs (e.g. raise for unsupported (combinations of) configs)
+
+    @model_validator(mode="after")
+    def validate_initial_adapter(self):
+        if self.initial_adapter is not None:
+            if self.resume is not None:
+                raise ValueError("initial_adapter and resume are mutually exclusive")
+            if self.model.lora is None or self.model.lora.modules_to_save:
+                raise ValueError("initial_adapter requires LoRA without modules_to_save")
+            source = self.initial_adapter.expanduser().resolve()
+            destinations = [self.run_dir.resolve()]
+            if self.ckpt is not None and self.ckpt.output_dir is not None:
+                destinations.append(self.ckpt.output_dir.resolve())
+            if self.clean and any(source.is_relative_to(path) or path.is_relative_to(source) for path in destinations):
+                raise ValueError("clean must not overlap the initial adapter")
+            self.initial_adapter = source
+        return self
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):

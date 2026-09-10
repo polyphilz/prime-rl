@@ -92,6 +92,13 @@ starts at the next absolute epoch seed; no dataloader sidecar is required.
 Historical RNG state is not restored, so this is not a bitwise replay guarantee.
 Callers must verify the original prepared rows and training settings match.
 
+For new data, `initial_adapter` loads a plain exported linear LoRA before optimizer
+construction and initial validation. Its rank, alpha, dropout, tensor names and
+shapes must match the configured LoRA. Unsupported adapter variants and partial
+loads fail. Optimizer, scheduler and data position start fresh; `data.epochs`
+counts only the new data's passes. This is mutually exclusive with `resume`.
+The caller must verify the adapter's base identity and checksum before launch.
+
 ## `inference` — vLLM server
 
 OpenAI-compatible API plus prime-rl custom endpoints (`/update_weights`, `/load_lora_adapter`, `/init_broadcaster`). Always use this entrypoint — never `vllm serve` directly. It starts a `vllm-router` on `server.port` (default 8000, the client-facing URL) fronting the engine on `backend_port` (default 8100); admin endpoints must target the engine port directly.
