@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch.utils.data import DataLoader, Dataset
 
 from prime_rl.configs.sft import PreparedDataConfig, SFTConfig
+from prime_rl.trainer.sft.data import Batch
 
 
 def validate_continuation(config: SFTConfig) -> None:
@@ -32,9 +33,6 @@ def validate_continuation(config: SFTConfig) -> None:
         raise ValueError("prepared continuation requires constant scheduling and zero LoRA dropout")
     if config.ckpt and any((config.ckpt.skip_optimizer, config.ckpt.skip_scheduler, config.ckpt.skip_progress)):
         raise ValueError("prepared continuation must restore optimizer, scheduler and progress")
-
-
-from prime_rl.trainer.sft.data import Batch
 
 
 def gradient_scale(supervised_tokens: int, accumulation_steps: int, fsdp_divisor: float) -> float:
